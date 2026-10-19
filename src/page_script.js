@@ -62,16 +62,23 @@
         : context.hasBody && context.newChat && !current && epoch === context.epoch;
     }
     function inspect(obj) {
-      if (!obj || typeof obj !== 'object') return;
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+        if (info.type === 'history') throw new Error('unsupported-history');
+        return;
+      }
       const candidate = C.id(obj.conversation_id) || C.id(obj.v?.conversation_id);
       if (!valid(candidate)) return;
       const detected = C.mode(obj.conversation_origin);
       const packet = { conversationId: boundId, pathname: location.pathname,
         mode: detected === 'unknown' ? requestMode : detected, observedAt: Date.now() };
-      if (info.type === 'history' && obj.mapping) {
+      if (info.type === 'history') {
         if (generation !== context.generation) return; // A send superseded this history request.
-        const stats = C.snapshot(obj);
-        publish({ ...packet, type: 'snapshot', stats, signal: C.signal(obj) });
+        const stats = C.snapshot(obj, info);
+        const shape = Array.isArray(obj.messages) ? 'messages' : obj.mapping && typeof obj.mapping === 'object' ? 'mapping' : 'unknown';
+        publish({ ...packet, type: 'snapshot', stats, signal: C.signal(obj), history: {
+          family: info.family, page: info.page, requestedTurns: info.requestedTurns,
+          status: stats ? (stats.complete ? 'branch' : 'partial') : shape === 'unknown' ? 'unsupported' : 'invalid'
+        } });
         return;
       }
       // Known protocol envelopes only. Do not recurse into arbitrary chat text/objects.
@@ -99,6 +106,8 @@
     try {
       const input = args[0];
       info = C.endpoint(typeof input === 'string' || input instanceof URL ? String(input) : input?.url, location.origin);
+      const method = String(args[1]?.method || input?.method || 'GET').toUpperCase();
+      if (info?.type === 'history' && method !== 'GET') info = null;
       const raw = args[1]?.body;
       if (info && typeof raw === 'string' && raw.length <= 4 * 1024 * 1024) {
         const parsed = JSON.parse(raw);
@@ -108,6 +117,14 @@
     } catch { /* Observing must never block the host request. */ }
     const context = { body, hasBody: !!body, epoch, generation,
       newChat: !C.route(location.pathname) };
+    function historyStatus(status) {
+      checkRoute();
+      if (info?.type !== 'history' || epoch !== context.epoch || generation !== context.generation ||
+        info.id !== C.route(location.pathname)) return;
+      publish({ type: 'history-status', conversationId: info.id, pathname: location.pathname, observedAt: Date.now(),
+        history: { family: info.family, page: info.page, requestedTurns: info.requestedTurns, status } });
+    }
+    historyStatus('pending');
     if (info?.type === 'send') {
       generation++; context.generation = generation;
       const cid = C.id(body?.conversation_id);
@@ -120,9 +137,19 @@
     const result = Reflect.apply(originalFetch, this, args);
     if (info) result.then(response => {
       // Redirects must stay on the same allowed origin and endpoint family.
-      if (response.url && !C.endpoint(response.url, location.origin)) return;
-      observe(response, info, context).catch(() => {});
-    }, () => {}).catch(() => {});
+      if (response.url) {
+        const target = C.endpoint(response.url, location.origin);
+        if (!target || target.type !== info.type || (info.type === 'history' && target.id !== info.id)) {
+          historyStatus('unreadable'); return;
+        }
+        if (info.type === 'history') info = { ...info, partial: info.partial || target.partial,
+          family: info.family === 'plural' ? 'plural' : target.family,
+          requestedTurns: info.requestedTurns ?? target.requestedTurns };
+      }
+      const type = response.headers.get('content-type') || '';
+      if (info.type === 'history' && !type.includes('application/json')) { historyStatus('unreadable'); return; }
+      observe(response, info, context).catch(() => historyStatus('unreadable'));
+    }, () => historyStatus('unreadable')).catch(() => {});
     return result;
   };
 })();

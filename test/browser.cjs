@@ -11,6 +11,8 @@ const history = { conversation_id: 'abc', conversation_origin: 'chatgpt', curren
   root: { parent: null }, u: { parent: 'root', message: message('user', '你好，测试提醒。', 'u') },
   a: { parent: 'u', message: message('assistant', '这是一个测试回答。', 'a') }
 } };
+const historyPage = { conversation_id: 'abc', conversation_origin: 'chatgpt', current_node: 'a',
+  messages: [history.mapping.u.message, history.mapping.a.message], page_info: { has_previous_page: true, start_cursor: 'older' } };
 const html = `<!doctype html><html><meta charset="utf-8"><title>Mock ChatGPT</title><body style="background:#f5f5f2;margin:40px"><main>
 <article><div data-message-id="u" data-message-author-role="user">你好，测试提醒。</div></article>
 <article><div data-message-id="a" data-message-author-role="assistant">这是一个测试回答。</div><button id="branch">另一个回答</button></article></main></body></html>`;
@@ -28,6 +30,8 @@ const html = `<!doctype html><html><meta charset="utf-8"><title>Mock ChatGPT</ti
     await context.route('**/*', async route => {
       const request = route.request(), url = new URL(request.url()); requests.push(url.pathname);
       if (url.origin !== 'https://chatgpt.com') return route.abort();
+      if (url.pathname === '/backend-api/conversations/abc')
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify(historyPage) });
       if (url.pathname === '/backend-api/conversation/abc') {
         if (delayHistory) await new Promise(r => setTimeout(r, delayHistory));
         return route.fulfill({ contentType: 'application/json', body: JSON.stringify(history) });
@@ -39,7 +43,7 @@ const html = `<!doctype html><html><meta charset="utf-8"><title>Mock ChatGPT</ti
     const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message));
     const waitText = (selector, pattern) => page.waitForFunction(({ selector, source }) =>
       new RegExp(source).test(document.querySelector(selector)?.textContent || ''), { selector, source: pattern.source });
-    const getHistory = () => page.evaluate(() => fetch('/backend-api/conversation/abc').then(r => r.json()));
+    const getHistory = () => page.evaluate(() => fetch('/backend-api/conversations/abc?num_turns=10&include_has_versions=true').then(r => r.json()));
     const send = body => page.evaluate(body => fetch('/backend-api/f/conversation', {
       method: 'POST', body: JSON.stringify(body)
     }).then(r => r.text()), body);
@@ -48,7 +52,8 @@ const html = `<!doctype html><html><meta charset="utf-8"><title>Mock ChatGPT</ti
     }).then(r => r.json()), body);
     await page.goto('https://chatgpt.com/c/abc');
     await page.locator('#cwm-badge').waitFor();
-    await getHistory(); await waitText('#cwm-state', /分支快照/);
+    await getHistory(); await waitText('#cwm-state', /本页消息统计/);
+    assert.match(await page.locator('#cwm-history').textContent(), /num_turns=10/);
     await page.locator('#cwm-badge').click();
     assert.match(await page.locator('#cwm-counts').textContent(), /1 条用户消息/);
     assert.equal((await page.locator('#cwm-panel').textContent()).includes('128,000'), false);
@@ -108,8 +113,8 @@ const html = `<!doctype html><html><meta charset="utf-8"><title>Mock ChatGPT</ti
     if (process.env.CWM_SCREENSHOT) await page.screenshot({ path: process.env.CWM_SCREENSHOT });
     assert.deepEqual(errors, []);
     // All requests were page navigation or explicit test actions; observer issued none.
-    assert.deepEqual([...new Set(requests)].sort(), ['/backend-api/conversation/abc', '/backend-api/conversation/init', '/backend-api/f/conversation', '/c/abc']);
-    console.log('PASS: actual MV3 load; snapshot; settings persistence; staged/snoozed reminders; Work/quota separation; SSE original body; untrusted bridge; SPA races; mobile layout; no added requests.');
+    assert.deepEqual([...new Set(requests)].sort(), ['/backend-api/conversation/abc', '/backend-api/conversation/init', '/backend-api/conversations/abc', '/backend-api/f/conversation', '/c/abc'].sort());
+    console.log('PASS: actual MV3 load; plural message page; settings persistence; staged/snoozed reminders; Work/quota separation; SSE original body; untrusted bridge; SPA races; mobile layout; no added requests.');
   } finally {
     await context?.close(); fs.rmSync(profile, { recursive: true, force: true });
   }

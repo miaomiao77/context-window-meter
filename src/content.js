@@ -2,6 +2,7 @@
 (function () {
   'use strict';
   let config = C.settings(), pathname = location.pathname, detected = 'unknown';
+  let historyRead = null;
   let network = null, signal = null, stats = null, root, badge, panel, notice, observer;
   let highestStage = 0, dismissed = 0, snoozeUntil = 0, ignored = false, scanTimer, open = false;
   let lastObservation = 0, routeChangedAt = 0, storageFailed = false;
@@ -18,7 +19,7 @@
   function resetRoute() {
     if (pathname === location.pathname) return false;
     retiredIds = new Set(visibleIds); visibleIds.clear();
-    pathname = location.pathname; detected = 'unknown'; network = null; signal = null; stats = null;
+    pathname = location.pathname; detected = 'unknown'; network = null; signal = null; stats = null; historyRead = null;
     highestStage = 0; dismissed = 0; snoozeUntil = 0; ignored = false; lastObservation = 0; routeChangedAt = Date.now();
     render(); return true;
   }
@@ -27,7 +28,8 @@
       Number.isSafeInteger(value[key]) && value[key] >= 0 && value[key] <= 1e10)) return null;
     if (!Array.isArray(value.activeIds) || value.activeIds.length > 100000) return null;
     if (!value.activeIds.every(x => C.id(x))) return null;
-    if (!C.id(value.branch)) return null;
+    if (!['branch', 'branch-slice', 'message-page'].includes(value.coverage)) return null;
+    if (!C.id(value.branch) && value.coverage !== 'message-page') return null;
     const breakdown = {};
     for (const role of C.ROLES) {
       const n = value.breakdown?.[role];
@@ -36,12 +38,14 @@
     }
     return { chars: value.chars, tokens: value.tokens, turns: value.turns, messages: value.messages,
       omitted: value.omitted === true, activeIds: value.activeIds, branch: value.branch, breakdown,
-      source: 'history', complete: true };
+      source: 'history', coverage: value.coverage, hasPrevious: value.hasPrevious === true,
+      requestedTurns: Number.isSafeInteger(value.requestedTurns) && value.requestedTurns >= 0 && value.requestedTurns <= 100000 ? value.requestedTurns : null,
+      complete: value.complete === true && value.coverage === 'branch' && value.requestedTurns == null && value.hasPrevious !== true };
   }
   window.addEventListener('message', event => {
     if (event.source !== window || event.origin !== location.origin || event.data?.type !== 'CWM_OBSERVATION_V2') return;
     const p = event.data.packet;
-    if (!p || !['snapshot', 'signal', 'stale'].includes(p.type)) return;
+    if (!p || !['snapshot', 'signal', 'stale', 'history-status'].includes(p.type)) return;
     resetRoute();
     if (p.pathname !== pathname || (p.conversationId && p.conversationId !== C.route(pathname))) return;
     if (!Number.isFinite(p.observedAt) || p.observedAt < lastObservation) return;
@@ -56,6 +60,11 @@
         { is_read_only: true } : { code: p.signal.code });
       // Do not let a later quota error hide a known conversation stop.
       if (!signal || !['hard', 'context'].includes(signal.kind) || ['hard', 'context'].includes(canonical.kind)) signal = canonical;
+    }
+    if (p.history && ['legacy', 'plural'].includes(p.history.family) &&
+      ['pending', 'branch', 'partial', 'unsupported', 'invalid', 'unreadable'].includes(p.history.status)) {
+      historyRead = { family: p.history.family, page: p.history.page === true, status: p.history.status,
+        requestedTurns: Number.isSafeInteger(p.history.requestedTurns) && p.history.requestedTurns >= 0 && p.history.requestedTurns <= 100000 ? p.history.requestedTurns : null };
     }
     if (p.type === 'snapshot') network = validStats(p.stats);
     if (p.type === 'stale') network = null;
@@ -104,12 +113,20 @@
     const title = strong ? '网站限制' : remind ? (stage === 2 ? '建议准备接续' : '接续提醒') : '接续';
     badge.textContent = `${title} · ${stats ? format(stats.turns) + ' 条' : '待观察'}`;
     root.dataset.level = strong ? 'stop' : remind ? 'remind' : 'quiet';
-    byId('state').textContent = stats ? (stats.source === 'history' ? '已读取当前分支快照' : '当前页面可见内容 · 可能少算') : '尚未取得可测量内容';
-    byId('counts').textContent = stats ? `${format(stats.turns)} 条用户消息 · ${format(stats.chars)} 个字符` : '打开已有对话，或正常发送消息后观察。';
+    byId('state').textContent = stats ? (stats.source === 'history' ? (stats.complete ? '已读取当前分支快照' : stats.coverage === 'message-page' ? '本页消息统计 · 非完整对话' : '当前分支片段 · 非完整对话') : '当前页面可见内容 · 可能少算') : '尚未取得可测量内容';
+    byId('counts').textContent = stats ? `${stats.source === 'history' && !stats.complete ? (stats.coverage === 'message-page' ? '本页 ' : '片段中 ') : ''}${format(stats.turns)} 条用户消息 · ${format(stats.chars)} 个字符` : '打开已有对话，或正常发送消息后观察。';
     byId('estimate').textContent = stats ? `约 ${format(stats.tokens)} 个文本 token（启发式估算）` : '';
     byId('coverage').textContent = stats?.source === 'history'
-      ? '快照包含接口提供的当前分支文本；不等于模型实际输入。未返回的系统内容、内部推理和附件编码无法计量。'
-      : '仅统计已呈现在页面上的用户与助手文本；折叠、虚拟滚动、工具结果和附件可能遗漏。刷新页面有机会取得完整分支快照。';
+      ? stats.complete ? '快照包含接口提供的当前分支文本；不等于模型实际输入。未返回的系统内容、内部推理和附件编码无法计量。'
+        : (stats.coverage === 'message-page' ? '仅统计本次响应 messages 中的消息，不展开其他版本，不将不同页直接相加。' : '仅统计从当前节点回溯得到的已返回片段。') +
+          (stats.requestedTurns != null ? ` 本次请求 num_turns=${stats.requestedTurns}；它是分页参数，不是总对话轮数。` : '') +
+          (stats.hasPrevious ? ' 接口标记前面还有历史页。' : '') + ' 尚未证明已覆盖完整 active branch，未出现提醒也不代表对话很短。'
+      : '仅统计已呈现在页面上的用户与助手文本；折叠、虚拟滚动、工具结果和附件可能遗漏。历史接口本身也可能分页，刷新不保证取得全部历史。';
+    const historyLabels = { pending: '已识别请求，等待响应', branch: '已解析分支快照', partial: '已解析局部历史',
+      unsupported: '已收到响应，但结构暂不支持', invalid: '已收到响应，但无法确认可计数片段', unreadable: '已识别请求，但未能读取响应' };
+    byId('history').textContent = historyRead
+      ? `${historyRead.family === 'plural' ? '复数历史接口' : '旧版历史接口'}${historyRead.page ? ' /messages' : ''}${historyRead.requestedTurns != null ? ` · num_turns=${historyRead.requestedTurns}` : ''}：${historyLabels[historyRead.status]}。`
+      : '尚未观察到支持的历史请求；网页缓存或其他传输路径可能不经过此观察器。';
     byId('mode-label').textContent = currentMode === 'work' ? 'Work：不套用 Chat 提醒阈值' : currentMode === 'chat'
       ? (detected === 'chat' ? 'Chat：按来源识别' : 'Chat：手动指定；若识别出 Work 会停用提醒')
       : '模式未确认：请在设置中指定 Chat 后启用规模提醒。';
@@ -148,7 +165,7 @@
       <button id="cwm-badge" type="button" aria-expanded="false" aria-controls="cwm-panel">接续 · 待观察</button>
       <div id="cwm-panel" role="dialog" aria-label="对话规模与接续提醒" hidden>
         <header><strong>接续提醒器</strong><button id="cwm-close" type="button" aria-label="关闭面板">×</button></header>
-        <p id="cwm-state"></p><p id="cwm-counts" class="cwm-counts"></p><p id="cwm-estimate"></p>
+        <p id="cwm-state"></p><p id="cwm-history" class="cwm-muted"></p><p id="cwm-counts" class="cwm-counts"></p><p id="cwm-estimate"></p>
         <p id="cwm-mode-label" class="cwm-muted"></p>
         <div id="cwm-reminder-box" class="cwm-callout" hidden><p id="cwm-reminder-text"></p><div class="cwm-buttons"><button id="cwm-snooze" type="button">30 分钟后提醒</button><button id="cwm-ignore" type="button">本次查看不再提醒</button></div></div>
         <p id="cwm-server" class="cwm-callout" hidden></p><p id="cwm-observed" class="cwm-muted"></p>

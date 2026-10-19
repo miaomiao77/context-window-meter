@@ -15,8 +15,16 @@ function createCWMCore() {
       const p = u.pathname.replace(/\/$/, '');
       if (/^\/backend-api\/(?:f\/)?conversation\/init$/.test(p)) return { type: 'init' };
       if (/^\/backend-api\/(?:f\/)?conversation(?:\/resume)?$/.test(p)) return { type: 'send' };
-      const match = p.match(/^\/backend-api\/conversation\/([a-zA-Z0-9_-]+)$/);
-      if (match && !['init', 'resume', 'prepare', 'limit'].includes(match[1])) return { type: 'history', id: id(match[1]) };
+      const match = p.match(/^\/backend-api\/(conversation|conversations)\/([a-zA-Z0-9_-]+)(\/messages)?$/);
+      if (match && !['init', 'resume', 'prepare', 'limit'].includes(match[2]) &&
+        (!match[3] || match[1] === 'conversations')) {
+        const family = match[1] === 'conversations' ? 'plural' : 'legacy';
+        const limited = family === 'plural' || ['num_turns', 'before', 'after', 'cursor', 'offset', 'limit', 'include_message_id']
+          .some(key => u.searchParams.has(key));
+        const turns = u.searchParams.get('num_turns');
+        return { type: 'history', id: id(match[2]), family, partial: limited,
+          page: !!match[3], requestedTurns: turns && /^\d+$/.test(turns) && Number(turns) <= 100000 ? Number(turns) : null };
+      }
       return null;
     } catch { return null; }
   }
@@ -80,13 +88,35 @@ function createCWMCore() {
     }
     return result;
   }
-  function snapshot(json) {
+  function snapshot(json, request = {}) {
+    const hasPrevious = typeof json?.page_info?.has_previous_page === 'boolean' ? json.page_info.has_previous_page : null;
+    const requestedTurns = Number.isSafeInteger(request.requestedTurns) && request.requestedTurns >= 0 && request.requestedTurns <= 100000
+      ? request.requestedTurns : null;
+    // Current plural API returns an ordered message PAGE, not the legacy mapping tree.
+    // Its official frontend synthesizes a root/parent chain; that is not proof of complete history.
+    if (request.family === 'plural' && Array.isArray(json?.messages)) {
+      const seen = new Set(), nodes = [];
+      for (const message of json.messages) {
+        if (!message || !id(message.id) || seen.has(message.id) ||
+          typeof message.author?.role !== 'string' || !message.content || typeof message.content !== 'object') return null;
+        seen.add(message.id); nodes.push(messageStats(message));
+      }
+      return { ...aggregate(nodes), activeIds: [...seen], branch: id(json.current_node),
+        mode: mode(json.conversation_origin), source: 'history', complete: false,
+        coverage: 'message-page', hasPrevious, requestedTurns };
+    }
     const mapping = json?.mapping;
-    if (!mapping || typeof mapping !== 'object' || !id(json.current_node)) return null;
+    if (!mapping || Array.isArray(mapping) || typeof mapping !== 'object' || !id(json.current_node)) return null;
+    const partial = request.partial === true || request.family === 'plural' || hasPrevious === true;
     const nodes = [], activeIds = [], visited = new Set();
     let cursor = json.current_node;
     while (cursor) {
-      if (visited.has(cursor) || !Object.hasOwn(mapping, cursor)) return null;
+      if (visited.has(cursor)) return null;
+      if (!Object.hasOwn(mapping, cursor)) {
+        // A page can end at a parent outside this response; never substitute all tree nodes.
+        if (partial && visited.size > 0) break;
+        return null;
+      }
       visited.add(cursor);
       const node = mapping[cursor];
       if (!node || typeof node !== 'object') return null;
@@ -95,10 +125,11 @@ function createCWMCore() {
         if (id(node.message.id)) activeIds.push(node.message.id);
       }
       cursor = node.parent;
-      if (cursor != null && !id(cursor)) return null;
+      if (cursor != null && cursor !== '' && !id(cursor)) return null;
     }
     return { ...aggregate(nodes), activeIds, branch: json.current_node,
-      mode: mode(json.conversation_origin), source: 'history', complete: true };
+      mode: mode(json.conversation_origin), source: 'history', complete: !partial,
+      coverage: partial ? 'branch-slice' : 'branch', hasPrevious, requestedTurns };
   }
   function signal(obj) {
     if (!obj || typeof obj !== 'object') return null;

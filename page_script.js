@@ -17,8 +17,16 @@ function createCWMCore() {
       const p = u.pathname.replace(/\/$/, '');
       if (/^\/backend-api\/(?:f\/)?conversation\/init$/.test(p)) return { type: 'init' };
       if (/^\/backend-api\/(?:f\/)?conversation(?:\/resume)?$/.test(p)) return { type: 'send' };
-      const match = p.match(/^\/backend-api\/conversation\/([a-zA-Z0-9_-]+)$/);
-      if (match && !['init', 'resume', 'prepare', 'limit'].includes(match[1])) return { type: 'history', id: id(match[1]) };
+      const match = p.match(/^\/backend-api\/(conversation|conversations)\/([a-zA-Z0-9_-]+)(\/messages)?$/);
+      if (match && !['init', 'resume', 'prepare', 'limit'].includes(match[2]) &&
+        (!match[3] || match[1] === 'conversations')) {
+        const family = match[1] === 'conversations' ? 'plural' : 'legacy';
+        const limited = family === 'plural' || ['num_turns', 'before', 'after', 'cursor', 'offset', 'limit', 'include_message_id']
+          .some(key => u.searchParams.has(key));
+        const turns = u.searchParams.get('num_turns');
+        return { type: 'history', id: id(match[2]), family, partial: limited,
+          page: !!match[3], requestedTurns: turns && /^\d+$/.test(turns) && Number(turns) <= 100000 ? Number(turns) : null };
+      }
       return null;
     } catch { return null; }
   }
@@ -82,13 +90,35 @@ function createCWMCore() {
     }
     return result;
   }
-  function snapshot(json) {
+  function snapshot(json, request = {}) {
+    const hasPrevious = typeof json?.page_info?.has_previous_page === 'boolean' ? json.page_info.has_previous_page : null;
+    const requestedTurns = Number.isSafeInteger(request.requestedTurns) && request.requestedTurns >= 0 && request.requestedTurns <= 100000
+      ? request.requestedTurns : null;
+    // Current plural API returns an ordered message PAGE, not the legacy mapping tree.
+    // Its official frontend synthesizes a root/parent chain; that is not proof of complete history.
+    if (request.family === 'plural' && Array.isArray(json?.messages)) {
+      const seen = new Set(), nodes = [];
+      for (const message of json.messages) {
+        if (!message || !id(message.id) || seen.has(message.id) ||
+          typeof message.author?.role !== 'string' || !message.content || typeof message.content !== 'object') return null;
+        seen.add(message.id); nodes.push(messageStats(message));
+      }
+      return { ...aggregate(nodes), activeIds: [...seen], branch: id(json.current_node),
+        mode: mode(json.conversation_origin), source: 'history', complete: false,
+        coverage: 'message-page', hasPrevious, requestedTurns };
+    }
     const mapping = json?.mapping;
-    if (!mapping || typeof mapping !== 'object' || !id(json.current_node)) return null;
+    if (!mapping || Array.isArray(mapping) || typeof mapping !== 'object' || !id(json.current_node)) return null;
+    const partial = request.partial === true || request.family === 'plural' || hasPrevious === true;
     const nodes = [], activeIds = [], visited = new Set();
     let cursor = json.current_node;
     while (cursor) {
-      if (visited.has(cursor) || !Object.hasOwn(mapping, cursor)) return null;
+      if (visited.has(cursor)) return null;
+      if (!Object.hasOwn(mapping, cursor)) {
+        // A page can end at a parent outside this response; never substitute all tree nodes.
+        if (partial && visited.size > 0) break;
+        return null;
+      }
       visited.add(cursor);
       const node = mapping[cursor];
       if (!node || typeof node !== 'object') return null;
@@ -97,10 +127,11 @@ function createCWMCore() {
         if (id(node.message.id)) activeIds.push(node.message.id);
       }
       cursor = node.parent;
-      if (cursor != null && !id(cursor)) return null;
+      if (cursor != null && cursor !== '' && !id(cursor)) return null;
     }
     return { ...aggregate(nodes), activeIds, branch: json.current_node,
-      mode: mode(json.conversation_origin), source: 'history', complete: true };
+      mode: mode(json.conversation_origin), source: 'history', complete: !partial,
+      coverage: partial ? 'branch-slice' : 'branch', hasPrevious, requestedTurns };
   }
   function signal(obj) {
     if (!obj || typeof obj !== 'object') return null;
@@ -229,16 +260,23 @@ const C = Object.freeze(createCWMCore());
         : context.hasBody && context.newChat && !current && epoch === context.epoch;
     }
     function inspect(obj) {
-      if (!obj || typeof obj !== 'object') return;
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+        if (info.type === 'history') throw new Error('unsupported-history');
+        return;
+      }
       const candidate = C.id(obj.conversation_id) || C.id(obj.v?.conversation_id);
       if (!valid(candidate)) return;
       const detected = C.mode(obj.conversation_origin);
       const packet = { conversationId: boundId, pathname: location.pathname,
         mode: detected === 'unknown' ? requestMode : detected, observedAt: Date.now() };
-      if (info.type === 'history' && obj.mapping) {
+      if (info.type === 'history') {
         if (generation !== context.generation) return; // A send superseded this history request.
-        const stats = C.snapshot(obj);
-        publish({ ...packet, type: 'snapshot', stats, signal: C.signal(obj) });
+        const stats = C.snapshot(obj, info);
+        const shape = Array.isArray(obj.messages) ? 'messages' : obj.mapping && typeof obj.mapping === 'object' ? 'mapping' : 'unknown';
+        publish({ ...packet, type: 'snapshot', stats, signal: C.signal(obj), history: {
+          family: info.family, page: info.page, requestedTurns: info.requestedTurns,
+          status: stats ? (stats.complete ? 'branch' : 'partial') : shape === 'unknown' ? 'unsupported' : 'invalid'
+        } });
         return;
       }
       // Known protocol envelopes only. Do not recurse into arbitrary chat text/objects.
@@ -266,6 +304,8 @@ const C = Object.freeze(createCWMCore());
     try {
       const input = args[0];
       info = C.endpoint(typeof input === 'string' || input instanceof URL ? String(input) : input?.url, location.origin);
+      const method = String(args[1]?.method || input?.method || 'GET').toUpperCase();
+      if (info?.type === 'history' && method !== 'GET') info = null;
       const raw = args[1]?.body;
       if (info && typeof raw === 'string' && raw.length <= 4 * 1024 * 1024) {
         const parsed = JSON.parse(raw);
@@ -275,6 +315,14 @@ const C = Object.freeze(createCWMCore());
     } catch { /* Observing must never block the host request. */ }
     const context = { body, hasBody: !!body, epoch, generation,
       newChat: !C.route(location.pathname) };
+    function historyStatus(status) {
+      checkRoute();
+      if (info?.type !== 'history' || epoch !== context.epoch || generation !== context.generation ||
+        info.id !== C.route(location.pathname)) return;
+      publish({ type: 'history-status', conversationId: info.id, pathname: location.pathname, observedAt: Date.now(),
+        history: { family: info.family, page: info.page, requestedTurns: info.requestedTurns, status } });
+    }
+    historyStatus('pending');
     if (info?.type === 'send') {
       generation++; context.generation = generation;
       const cid = C.id(body?.conversation_id);
@@ -287,9 +335,19 @@ const C = Object.freeze(createCWMCore());
     const result = Reflect.apply(originalFetch, this, args);
     if (info) result.then(response => {
       // Redirects must stay on the same allowed origin and endpoint family.
-      if (response.url && !C.endpoint(response.url, location.origin)) return;
-      observe(response, info, context).catch(() => {});
-    }, () => {}).catch(() => {});
+      if (response.url) {
+        const target = C.endpoint(response.url, location.origin);
+        if (!target || target.type !== info.type || (info.type === 'history' && target.id !== info.id)) {
+          historyStatus('unreadable'); return;
+        }
+        if (info.type === 'history') info = { ...info, partial: info.partial || target.partial,
+          family: info.family === 'plural' ? 'plural' : target.family,
+          requestedTurns: info.requestedTurns ?? target.requestedTurns };
+      }
+      const type = response.headers.get('content-type') || '';
+      if (info.type === 'history' && !type.includes('application/json')) { historyStatus('unreadable'); return; }
+      observe(response, info, context).catch(() => historyStatus('unreadable'));
+    }, () => historyStatus('unreadable')).catch(() => {});
     return result;
   };
 })();

@@ -1,0 +1,12 @@
+{
+  "conversation_id": "abc",
+  "conversation_origin": "chatgpt",
+  "current_node": "a2",
+  "page_info": { "has_previous_page": true, "start_cursor": "synthetic-older-cursor" },
+  "messages": [
+    { "id": "u1", "author": { "role": "user" }, "content": { "content_type": "text", "parts": ["第一页问题"] } },
+    { "id": "a1", "author": { "role": "assistant" }, "content": { "content_type": "text", "parts": ["第一页回答"] }, "metadata": { "has_versions": true }, "versions": [{ "content": { "parts": ["这一替代版本不应被计数"] } }] },
+    { "id": "u2", "author": { "role": "user" }, "content": { "content_type": "text", "parts": ["第二个问题"] } },
+    { "id": "a2", "author": { "role": "assistant" }, "content": { "content_type": "text", "parts": ["第二个回答"] } }
+  ]
+}

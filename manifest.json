@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Context Window Meter · 接续提醒器",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "观察对话规模，提供可调整的接续提醒并识别部分网站限制信号。不显示未经验证的剩余容量；非 OpenAI 官方。",
   "icons": {
     "16": "icons/icon16.png",

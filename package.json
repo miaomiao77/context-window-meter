@@ -1,6 +1,6 @@
 {
   "name": "context-window-meter",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Local conversation-size observations and configurable continuation reminders",
   "scripts": {
     "test": "python3 scripts/build.py --check && node --test test/*.test.js",

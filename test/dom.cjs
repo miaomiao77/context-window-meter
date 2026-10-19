@@ -38,6 +38,28 @@ const fixture = { conversation_id: 'abc', conversation_origin: 'chatgpt', curren
     await w.fetch('/backend-api/conversation/abc');
     await waitFor(() => /分支快照/.test(el('state').textContent));
     assert.match(el('counts').textContent, /1 条用户消息 · 7 个字符/);
+    // Reproduce the real plural URL with a messages/page_info shape and NO usable DOM fallback.
+    const oldMarkup = d.querySelector('main').innerHTML;
+    d.querySelector('main').innerHTML = '<p>No message role attributes in this mock view.</p>';
+    responseData = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/conversation-page-synthetic.json'), 'utf8'));
+    const pluralUrl = '/backend-api/conversations/abc?num_turns=10&include_has_versions=true';
+    await w.fetch(pluralUrl);
+    await waitFor(() => /本页消息统计/.test(el('state').textContent));
+    assert.match(el('counts').textContent, /本页 2 条用户消息 · 20 个字符/);
+    assert.match(el('history').textContent, /复数历史接口 · num_turns=10/);
+    assert.match(el('coverage').textContent, /前面还有历史页/);
+    assert.doesNotMatch(el('state').textContent, /分支快照/);
+    await w.fetch(pluralUrl); await sleep(400);
+    assert.match(el('counts').textContent, /本页 2 条用户消息/, 'repeated page is not added twice');
+    responseData = { unrecognized_schema: [] }; await w.fetch(pluralUrl);
+    await waitFor(() => /结构暂不支持/.test(el('history').textContent));
+    assert.match(el('state').textContent, /尚未取得/);
+    responseData = '{'; await w.fetch(pluralUrl);
+    await waitFor(() => /未能读取响应/.test(el('history').textContent));
+    responseData = fixture; d.querySelector('main').innerHTML = oldMarkup;
+    await w.fetch('/backend-api/conversation/abc');
+    await waitFor(() => /分支快照/.test(el('state').textContent));
+
     assert.equal(d.querySelectorAll('#cwm-reminder').length, 1, 'root ID must be unique');
     el('badge').click(); assert.equal(el('panel').hidden, false);
     const form = el('settings');
@@ -87,7 +109,7 @@ const fixture = { conversation_id: 'abc', conversation_origin: 'chatgpt', curren
     await waitFor(() => writes.length === 2); await sleep(20); assert.equal(el('notice').hidden, false);
     el('ignore').click(); assert.equal(el('notice').hidden, true);
     el('close').click(); assert.equal(el('panel').hidden, true);
-    assert.equal(calls, 4, 'no additional fetches issued by the extension');
+    assert.equal(calls, 9, 'no additional fetches issued by the extension');
     assert.deepEqual(errors, []);
     console.log('PASS: DOM integration: unique IDs, snapshot, form/save whitelist, stages/dismiss/snooze/ignore, text streaming, Work/quota/hard-cap separation, safe bridge rendering, SPA stale DOM, no extra requests.');
   } finally { w.close(); }

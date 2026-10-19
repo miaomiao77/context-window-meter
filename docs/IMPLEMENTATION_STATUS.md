@@ -23,8 +23,8 @@ Work usage / model cap / input too large / read-only 不能等同会话容量耗
 
 ## 阶段
 1. [完成] 恢复基线、研究报告、建立分支及本检查点。
-2. [进行中] 共享统计核心、fetch 观察器、状态与提醒界面。
-3. [待做] 回归测试、浏览器测试、权限/存储核验、打包及安装说明。
+2. [完成] 统计核心、fetch 观察器、状态与提醒界面；当前候选 2.0.2。
+3. [完成] 核心/模拟 DOM 回归、权限/存储核验、打包及说明；真实浏览器受环境限制，待用户验收。
 
 ## 恢复方法
 读取本文件、git status、最新提交及 test/；从当前阶段继续。
@@ -47,3 +47,11 @@ Work usage / model cap / input too large / read-only 不能等同会话容量耗
 ### 2.0.1：用户实测启动崩溃修复
 2026-10-19 用户截图：Uncaught TypeError: Cannot read properties of undefined (reading settings)，content.js:5。共享核心对象缺失，具体此前为何未定义尚未证实。
 改为 core.js 纯工厂 + src/ 入口源码，用 scripts/build.py 生成两个各自包含核心的运行脚本；manifest 不再独立加载 core.js。禁止依赖全局共享核心的启动回归已加入，18 项核心测试和 DOM 测试通过。下一步请用户覆盖升级到 2.0.1、重载扩展并刷新 ChatGPT，观察真实运行结果。
+
+### 2.0.2：复数历史接口与局部统计修复
+2026-10-19 用户确认 2.0.1 UI 正常，实际 GET /backend-api/conversations/{id}?num_turns=10&include_has_versions=true 没有读数。
+确认三个原因：matcher 只匹配旧单数、解析器只读 mapping、UI 桥将历史数据强制标为 complete。
+公开官方前端还证实新接口返回 messages/page_info，由网页合成 mapping；新增 /messages 分页观察。证据 URL、脚本哈希、函数与局限见 PAGINATION_EVIDENCE.md。
+修复精确路由及 GET 限制，支持消息页和分页 mapping 片段；保留 partial 语义，不跨页累加、不主动补历史。诊断区分未捕获、待响应、已解析、不支持和读取失败；不输出正文、游标或 URL 标识。
+27 项 Node 测试、模拟 DOM 回归通过；实际 Chromium 仍受原环境限制，浏览器脚本仅完成更新与语法检查。生成 2.0.2 安装包并随源码保存至同名远程分支。
+下一步：用户覆盖升级、重载扩展并刷新 ChatGPT，核对“本页消息统计”和固定诊断。没有完整跨页 active branch 前，不应把本页数量当作总量或剩余容量；不重做整个审计，也不把分页片段相加来凑总量。

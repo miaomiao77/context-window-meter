@@ -96,7 +96,8 @@ test('history observation never modifies response body or sends an extra request
 test('off-origin requests and old conversation responses cannot affect current stats', async () => {
   let resolve; const h = harness(() => new Promise(r => { resolve = r; }));
   h.window.fetch('/backend-api/conversation/abc'); h.location.pathname = '/c/def'; resolve(jsonResponse(fixture()));
-  await settle(); assert.equal(h.packets.length, 0);
+  await settle(); assert.equal(h.packets.filter(p => p.type !== 'history-status').length, 0);
+  assert.equal(h.packets[0].history.status, 'pending');
   const other = harness(() => Promise.resolve(jsonResponse(fixture())));
   await other.window.fetch('https://evil.test/backend-api/conversation/abc'); await settle(); assert.equal(other.packets.length, 0);
 });
@@ -106,7 +107,7 @@ test('late history cannot overwrite measurements after a send', async () => {
   await h.window.fetch('/backend-api/f/conversation', { body: JSON.stringify({ conversation_id: 'abc', messages: [] }) });
   resolve(jsonResponse(fixture())); await settle();
   assert.equal(h.packets.some(p => p.type === 'snapshot'), false);
-  assert.equal(h.packets[0].type, 'stale');
+  assert.equal(h.packets.at(-1).type, 'stale');
 });
 test('JSON errors and init banners bind to the request conversation, never arbitrary visible chat', async () => {
   const h = harness(() => Promise.resolve(jsonResponse({ detail: { code: 'conversation_too_large' } }, 400)));
@@ -156,4 +157,81 @@ test('each manifest entry starts independently without a global core or module h
     vm.runInNewContext(fs.readFileSync(require.resolve('../' + script.js[0]), 'utf8'), globals);
     assert.deepEqual(globals.module.exports, {}, 'host module export must not be changed');
   }
+});
+
+const pluralUrl = '/backend-api/conversations/abc?num_turns=10&include_has_versions=true';
+const pageFixture = () => JSON.parse(fs.readFileSync(__dirname + '/fixtures/conversation-page-synthetic.json', 'utf8'));
+test('observed plural URL, pagination page and legacy variants match without broadening origin/path scope', () => {
+  const info = C.endpoint(pluralUrl);
+  assert.equal(info.type, 'history'); assert.equal(info.family, 'plural');
+  assert.equal(info.id, 'abc'); assert.equal(info.partial, true); assert.equal(info.requestedTurns, 10);
+  assert.equal(C.endpoint('/backend-api/conversations/abc').partial, true);
+  assert.equal(C.endpoint('/backend-api/conversations/abc/messages?before=cursor&num_turns=10').page, true);
+  assert.equal(C.endpoint('/backend-api/conversation/abc?num_turns=10').partial, true);
+  assert.equal(C.endpoint('/backend-api/conversation/abc').partial, false);
+  for (const url of ['https://evil.test'+pluralUrl, '/backend-api/conversations', '/backend-api/conversations/abc/versions',
+    '/backend-api/conversations/abc/message_supplements', '/backend-api/conversation/abc/messages']) assert.equal(C.endpoint(url), null);
+});
+test('messages/page_info response is counted as a page, excluding versions and hidden branch assumptions', () => {
+  const obj = pageFixture(), info = C.endpoint(pluralUrl), stats = C.snapshot(obj, info);
+  assert.equal(stats.turns, 2); assert.equal(stats.messages, 4); assert.equal(stats.chars, 20);
+  assert.equal(stats.complete, false); assert.equal(stats.coverage, 'message-page');
+  assert.equal(stats.hasPrevious, true); assert.equal(stats.requestedTurns, 10);
+  obj.current_node = 'outside-this-page'; obj.page_info.has_previous_page = false;
+  assert.equal(C.snapshot(obj, info).complete, false, 'no previous page is not proof the entire active branch is covered');
+  delete obj.current_node; assert.equal(C.snapshot(obj, info).turns, 2, 'a page does not require a full-tree leaf');
+});
+test('partial tree stops at the page boundary but never uses all nodes or accepts a cycle', () => {
+  const obj = fixture(); obj.mapping.u.parent = 'not-returned';
+  const info = C.endpoint(pluralUrl), stats = C.snapshot(obj, info);
+  assert.equal(stats.complete, false); assert.equal(stats.turns, 1); assert.equal(stats.coverage, 'branch-slice');
+  assert.equal(stats.activeIds.includes('off'), false);
+  assert.equal(C.snapshot(fixture(), info).complete, false, 'even an apparent root cannot undo a limited request');
+  obj.mapping.u.parent = 'a'; assert.equal(C.snapshot(obj, info), null);
+  obj.current_node = 'not-returned'; assert.equal(C.snapshot(obj, info), null);
+});
+test('unknown page schemas, duplicate IDs and malformed messages are not silently counted', () => {
+  const info = C.endpoint(pluralUrl), obj = pageFixture();
+  assert.equal(C.snapshot({ items: obj.messages }, info), null);
+  obj.messages.push(obj.messages[0]); assert.equal(C.snapshot(obj, info), null);
+  obj.messages = [{ id: 'untyped' }]; assert.equal(C.snapshot(obj, info), null);
+  const empty = C.snapshot({ messages: [], page_info: { has_previous_page: true } }, info);
+  assert.equal(empty.messages, 0); assert.equal(empty.complete, false);
+});
+test('exact observed GET parses a partial page with no extra fetch and never adds repeated pages', async () => {
+  let calls = 0; const h = harness(() => { calls++; return Promise.resolve(jsonResponse(pageFixture())); });
+  for (let i = 0; i < 2; i++) { await h.window.fetch(pluralUrl); await settle(); }
+  const snapshots = h.packets.filter(p => p.type === 'snapshot');
+  assert.equal(calls, 2); assert.equal(snapshots.length, 2);
+  for (const p of snapshots) { assert.equal(p.stats.turns, 2); assert.equal(p.stats.complete, false); assert.equal(p.history.status, 'partial'); }
+  assert.equal(JSON.stringify(h.packets).includes('第一页'), false);
+  assert.equal(JSON.stringify(h.packets).includes('synthetic-older-cursor'), false);
+});
+test('older /messages pages without current_node remain partial and are not merged into a guessed branch', async () => {
+  const page = pageFixture(); delete page.current_node;
+  const h = harness(() => Promise.resolve(jsonResponse(page)));
+  await h.window.fetch('/backend-api/conversations/abc/messages?before=older&num_turns=10'); await settle();
+  assert.equal(h.packets.at(-1).stats.turns, 2); assert.equal(h.packets.at(-1).history.page, true);
+  assert.equal(h.packets.at(-1).stats.complete, false);
+});
+test('GET only: writes to history endpoints are not observed', async () => {
+  const h = harness(() => Promise.resolve(jsonResponse(pageFixture())));
+  for (const method of ['POST', 'PATCH', 'DELETE']) await h.window.fetch(pluralUrl, { method });
+  await settle(); assert.equal(h.packets.length, 0);
+});
+test('unsupported JSON and failed reads emit scoped diagnostics instead of perpetual silent waiting', async () => {
+  const h = harness(() => Promise.resolve(jsonResponse({ items: [] })));
+  await h.window.fetch(pluralUrl); await settle();
+  assert.equal(h.packets.at(-1).stats, null); assert.equal(h.packets.at(-1).history.status, 'unsupported');
+  const broken = harness(() => Promise.resolve(new Response('{', { headers: { 'content-type': 'application/json' } })));
+  await broken.window.fetch(pluralUrl); await settle();
+  assert.equal(broken.packets.at(-1).history.status, 'unreadable');
+  const html = harness(() => Promise.resolve(new Response('not json', { headers: { 'content-type': 'text/html' } })));
+  await html.window.fetch(pluralUrl); await settle(); assert.equal(html.packets.at(-1).history.status, 'unreadable');
+});
+test('plural responses and failures after navigation cannot repopulate another conversation', async () => {
+  let resolve; const h = harness(() => new Promise(r => { resolve = r; }));
+  h.window.fetch(pluralUrl); h.location.pathname = '/c/def'; resolve(jsonResponse(pageFixture()));
+  await settle(); assert.equal(h.packets.filter(p => p.type === 'snapshot').length, 0);
+  assert.equal(h.packets.length, 1); assert.equal(h.packets[0].conversationId, 'abc');
 });
