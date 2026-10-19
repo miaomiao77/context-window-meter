@@ -16,7 +16,6 @@ function harness(fetchImpl, path = '/c/abc') {
     addEventListener: (name, fn) => { listeners[name] = fn; } };
   const globals = { window, location, URL, TextDecoder, setTimeout, clearTimeout, console };
   globals.globalThis = globals;
-  vm.runInNewContext(fs.readFileSync(require.resolve('../core'), 'utf8'), globals);
   vm.runInNewContext(fs.readFileSync(require.resolve('../page_script'), 'utf8'), globals);
   return { window, location, packets, listeners };
 }
@@ -143,4 +142,18 @@ test('manifest permission scope and packaged scripts have no runtime dependencie
   for (const entry of manifest.content_scripts) assert.deepEqual(entry.matches, ['https://chatgpt.com/*']);
   const pkg = JSON.parse(fs.readFileSync(require.resolve('../package.json')));
   assert.equal(pkg.dependencies, undefined);
+});
+
+test('each manifest entry starts independently without a global core or module handshake', () => {
+  const manifest = JSON.parse(fs.readFileSync(require.resolve('../manifest.json')));
+  for (const script of manifest.content_scripts) {
+    assert.equal(script.js.length, 1, 'entry must be self contained');
+    const globals = { window: { fetch: async () => new Response('{}'), addEventListener() {} },
+      document: { readyState: 'loading', addEventListener() {} },
+      location: { pathname: '/', origin: 'https://chatgpt.com' },
+      module: { exports: {} }, URL, TextDecoder, setTimeout, clearTimeout };
+    Object.defineProperty(globals, '__CWM_CORE', { get() { throw new Error('global core must not be read'); } });
+    vm.runInNewContext(fs.readFileSync(require.resolve('../' + script.js[0]), 'utf8'), globals);
+    assert.deepEqual(globals.module.exports, {}, 'host module export must not be changed');
+  }
 });

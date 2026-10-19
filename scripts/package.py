@@ -3,12 +3,15 @@ from pathlib import Path
 import hashlib
 import json
 import zipfile
+import subprocess
+import sys
 
 root = Path(__file__).resolve().parents[1]
+subprocess.run([sys.executable, str(root / 'scripts' / 'build.py'), '--check'], check=True)
 version = json.loads((root / 'manifest.json').read_text())['version']
 output = root / 'dist' / f'context-continuation-reminder-{version}.zip'
 output.parent.mkdir(exist_ok=True)
-files = ['manifest.json', 'core.js', 'page_script.js', 'content.js', 'styles.css',
+files = ['manifest.json', 'page_script.js', 'content.js', 'styles.css',
          'LICENSE', 'README.md', 'PRIVACY.md', 'INSTALL.md', 'docs/VALIDATION.md', 'docs/IMPLEMENTATION_STATUS.md',
          'icons/icon16.png', 'icons/icon48.png', 'icons/icon128.png']
 with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:

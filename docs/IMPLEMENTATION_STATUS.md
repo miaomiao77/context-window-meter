@@ -43,3 +43,7 @@ Work usage / model cap / input too large / read-only 不能等同会话容量耗
 17 项核心测试及模拟 DOM 交互回归通过；修复了导航时旧 DOM 残留、响应副本异常清理、DOM 根 ID 冲突等问题。真实 Chromium 因环境 socket 限制未能启动，详见 VALIDATION.md，尚未经过真实账号网站验收。
 已移除不可靠容量百分比，提供两级可调提醒、手动 Chat 模式、已知服务端限制分类及最小本机设置存储。接续按钮按用户要求未做。
 交付包含安装包、INSTALL.md 和独立分支；主分支不变。下一步是用户安装验收/可运行浏览器环境的回归，不应重新调查全部前端代码或重复旧审计。
+
+### 2.0.1：用户实测启动崩溃修复
+2026-10-19 用户截图：Uncaught TypeError: Cannot read properties of undefined (reading settings)，content.js:5。共享核心对象缺失，具体此前为何未定义尚未证实。
+改为 core.js 纯工厂 + src/ 入口源码，用 scripts/build.py 生成两个各自包含核心的运行脚本；manifest 不再独立加载 core.js。禁止依赖全局共享核心的启动回归已加入，18 项核心测试和 DOM 测试通过。下一步请用户覆盖升级到 2.0.1、重载扩展并刷新 ChatGPT，观察真实运行结果。

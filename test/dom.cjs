@@ -29,8 +29,11 @@ const fixture = { conversation_id: 'abc', conversation_origin: 'chatgpt', curren
     get: async () => data,
     set: async value => { data = JSON.parse(JSON.stringify(value)); writes.push(data); storageListener?.({ cwmSettingsV2: { newValue: data.cwmSettingsV2 } }, 'local'); }
   }, onChanged: { addListener: cb => { storageListener = cb; } } } };
+  // The host may have module-like objects; entry points must not depend on them.
+  w.module = { exports: {} };
+  Object.defineProperty(w, '__CWM_CORE', { get() { throw new Error('global core access forbidden'); } });
   try {
-    for (const file of ['core.js', 'page_script.js', 'content.js']) w.eval(fs.readFileSync(path.join(project, file), 'utf8'));
+    for (const file of ['page_script.js', 'content.js']) w.eval(fs.readFileSync(path.join(project, file), 'utf8'));
     await waitFor(() => el('badge'));
     await w.fetch('/backend-api/conversation/abc');
     await waitFor(() => /分支快照/.test(el('state').textContent));

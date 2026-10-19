@@ -1,6 +1,6 @@
 # Context Window Meter · 接续提醒器
 
-个人维护的 ChatGPT 浏览器扩展 fork，基于原 Context Window Meter 改造。当前版本 **2.0.0**，非 OpenAI 官方产品。
+个人维护的 ChatGPT 浏览器扩展 fork，基于原 Context Window Meter 改造。当前版本 **2.0.1**，非 OpenAI 官方产品。
 
 目标是在长对话中提醒你提前整理接续信息。**没有可靠的官方剩余容量信号，不能保证在触顶前提醒。** 本扩展不再显示“已占用模型窗口百分比”“剩余 token”或预计剩余轮数。
 
@@ -45,8 +45,13 @@
 
 MAIN 世界与页面共享环境，消息桥不是可信安全边界；UI只接受固定枚举与有界数字，页面仍可能伪造读数。扩展不会因桥消息执行请求、写入聊天内容或运行代码。
 
+## 2.0.1 启动修复
+
+用户在真实 Chrome 中遇到 `content.js:5` 读取 `settings` 时共享对象为 undefined。现在每个入口脚本内嵌自己的核心工厂，不再依赖前一个脚本设置全局变量。具体原始缺失原因未由截图单独确认。
+
 ## 开发与验证
 
+- `npm run build`：将 core.js 和 src/ 中的入口合并为两个自包含浏览器脚本；无需构建依赖。修改源码后运行它，不直接编辑生成的 content.js/page_script.js。
 - `npm test`：Node 内置测试运行器，无需安装依赖。
 - `npm run package`：Python 标准库生成只包含运行文件和说明的 ZIP，不包含 fixtures、测试、git 历史。
 - `npm run test:browser`：可选 Chromium 回归，需要开发环境安装 Playwright 和浏览器；生产包不包含它们。

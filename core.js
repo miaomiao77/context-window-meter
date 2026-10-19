@@ -1,9 +1,5 @@
-/* Shared, dependency-free logic. No network, DOM, or persistence. */
-(function (root, factory) {
-  const api = Object.freeze(factory());
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  else Object.defineProperty(root, '__CWM_CORE', { value: api, configurable: true });
-})(globalThis, function () {
+/* Pure shared logic. Browser bundles embed the factory in their own closure. */
+function createCWMCore() {
   'use strict';
   const ROLES = ['user', 'assistant', 'tool', 'reasoning', 'system', 'developer', 'other'];
   const DEFAULTS = Object.freeze({ enabled: true, mode: 'auto', firstTurns: 50, secondTurns: 100,
@@ -163,4 +159,7 @@
   }
   return { ROLES, DEFAULTS, id, route, endpoint, mode, text, estimateTokens, messageStats,
     aggregate, snapshot, signal, settings, effectiveMode, level, sseParser };
-});
+}
+
+// Node test export; excluded from browser bundles.
+module.exports = Object.freeze(createCWMCore());

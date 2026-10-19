@@ -2,7 +2,7 @@
 
 这是桌面 Chrome / Edge 等 Chromium 浏览器的扩展包，不是 iPhone 应用。尚未上架商店。
 
-1. 下载并解压 `context-continuation-reminder-2.0.0.zip`，放进一个之后不会随意删除的文件夹。
+1. 下载并解压 `context-continuation-reminder-2.0.1.zip`，放进一个之后不会随意删除的文件夹。
 2. 打开 Chrome 的 `chrome://extensions`（Edge 用 `edge://extensions`）。
 3. 打开右上角“开发者模式”，点击“加载已解压的扩展程序”。
 4. 选择**直接包含 manifest.json 的文件夹**，不是 ZIP 本身。

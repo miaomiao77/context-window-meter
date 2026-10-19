@@ -1,6 +1,6 @@
 # Draft listing — not submitted
 Name: Context Window Meter · 接续提醒器
-Version: 2.0.0
+Version: 2.0.1
 
 Observe conversation size and set personal continuation reminders for ChatGPT.
 No capacity percentage or claimed remaining tokens. Local settings only.
