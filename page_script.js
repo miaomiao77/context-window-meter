@@ -43,7 +43,8 @@
       if (stopped) throw new Error('observation-incomplete');
     } finally {
       clearTimeout(timeout); cancellations.delete(cancel);
-      reader.releaseLock();
+      // Release a partially consumed clone on parsing/budget errors as well.
+      cancel(); reader.releaseLock();
     }
   }
   async function observe(response, info, context) {
@@ -100,7 +101,11 @@
       const input = args[0];
       info = C.endpoint(typeof input === 'string' || input instanceof URL ? String(input) : input?.url, location.origin);
       const raw = args[1]?.body;
-      if (info && typeof raw === 'string' && raw.length <= 4 * 1024 * 1024) body = JSON.parse(raw);
+      if (info && typeof raw === 'string' && raw.length <= 4 * 1024 * 1024) {
+        const parsed = JSON.parse(raw);
+        body = { conversation_id: C.id(parsed?.conversation_id),
+          conversation_origin: typeof parsed?.conversation_origin === 'string' ? parsed.conversation_origin : null };
+      }
     } catch { /* Observing must never block the host request. */ }
     const context = { body, hasBody: !!body, epoch, generation,
       newChat: !C.route(location.pathname) };

@@ -4,8 +4,9 @@
   const C = globalThis.__CWM_CORE;
   let config = C.settings(), pathname = location.pathname, detected = 'unknown';
   let network = null, signal = null, stats = null, root, badge, panel, notice, observer;
-  let dismissed = 0, snoozeUntil = 0, ignored = false, scanTimer, open = false;
+  let highestStage = 0, dismissed = 0, snoozeUntil = 0, ignored = false, scanTimer, open = false;
   let lastObservation = 0, routeChangedAt = 0, storageFailed = false;
+  let visibleIds = new Set(), retiredIds = new Set();
   const byId = key => root.querySelector('#cwm-' + key);
   const format = value => new Intl.NumberFormat('zh-CN').format(value || 0);
   const LABELS = {
@@ -17,8 +18,9 @@
   };
   function resetRoute() {
     if (pathname === location.pathname) return false;
+    retiredIds = new Set(visibleIds); visibleIds.clear();
     pathname = location.pathname; detected = 'unknown'; network = null; signal = null; stats = null;
-    dismissed = 0; snoozeUntil = 0; ignored = false; lastObservation = 0; routeChangedAt = Date.now();
+    highestStage = 0; dismissed = 0; snoozeUntil = 0; ignored = false; lastObservation = 0; routeChangedAt = Date.now();
     render(); return true;
   }
   function validStats(value) {
@@ -76,6 +78,9 @@
       values.push(C.messageStats({ author: { role: el.getAttribute('data-message-author-role') },
         content: { parts: [el.innerText || ''] } }));
     }
+    // Old messages may linger during client-side navigation; never relabel them as the new chat.
+    if (retiredIds.size && [...ids].some(id => retiredIds.has(id))) { stats = network; render(); return; }
+    retiredIds.clear(); visibleIds = ids;
     const visible = values.length ? { ...C.aggregate(values), source: 'dom', complete: false } : null;
     // A changed branch/new stream invalidates a previously loaded active branch.
     if (network && ids.size && [...ids].some(id => !network.activeIds.includes(id))) network = null;
@@ -91,7 +96,10 @@
   function render() {
     if (!root) return;
     const currentMode = C.effectiveMode(detected, config.mode);
-    const stage = C.level(stats, config, detected);
+    const measuredStage = C.level(stats, config, detected);
+    highestStage = Math.max(highestStage, measuredStage);
+    // Partial DOM counts may fall after a send/virtual scroll; do not silently retract a reminder.
+    const stage = currentMode === 'chat' && config.enabled ? highestStage : 0;
     const remind = stage > dismissed && !ignored && Date.now() >= snoozeUntil;
     const strong = signal && ['hard', 'context'].includes(signal.kind);
     const title = strong ? '网站限制' : remind ? (stage === 2 ? '建议准备接续' : '接续提醒') : '接续';
@@ -109,7 +117,7 @@
     byId('server').hidden = !signal;
     byId('server').textContent = signal ? LABELS[signal.kind] : '';
     byId('observed').textContent = signal ? `观测到：${signal.code}。这里只记录收到过的状态，不保证它仍然有效。` : '暂未观测到已知限制信号；这不代表还剩多少容量。';
-    byId('reminder-text').textContent = stage === 2 ? '对话已经很长，可以先整理接续信息，避免突然无法继续。' : '到了你设定的提醒点，可以开始准备接续信息。';
+    byId('reminder-text').textContent = measuredStage < stage ? '本次查看曾达到你设定的提醒点；当前局部读数变小不代表对话容量已恢复。' : stage === 2 ? '对话已经很长，可以先整理接续信息，避免突然无法继续。' : '到了你设定的提醒点，可以开始准备接续信息。';
     notice.hidden = !remind;
     byId('notice-text').textContent = stage === 2 ? '建议准备接续信息' : '到了接续提醒点';
     byId('reminder-box').hidden = !stage || ignored || Date.now() < snoozeUntil;
@@ -159,9 +167,15 @@
     badge.addEventListener('click', () => setOpen(!open));
     byId('close').addEventListener('click', () => setOpen(false));
     byId('notice-open').addEventListener('click', () => setOpen(true));
-    byId('dismiss').addEventListener('click', () => { dismissed = C.level(stats, config, detected); render(); });
+    byId('dismiss').addEventListener('click', () => { dismissed = highestStage; render(); });
     byId('snooze').addEventListener('click', () => { snoozeUntil = Date.now() + 1800000; render(); });
     byId('ignore').addEventListener('click', () => { ignored = true; render(); });
+    // Editing/regeneration/branch controls can change the active branch without a history GET.
+    document.addEventListener('click', event => {
+      if (!root.contains(event.target) && event.target.closest?.('article button, [data-message-id] button')) {
+        network = null; scheduleScan();
+      }
+    }, true);
     document.addEventListener('keydown', event => { if (event.key === 'Escape' && open) setOpen(false); });
     document.addEventListener('click', event => { if (open && !root.contains(event.target)) setOpen(false); });
     byId('settings').addEventListener('submit', async event => {
@@ -172,11 +186,11 @@
       if (next.secondTurns <= next.firstTurns || next.secondChars <= next.firstChars) {
         byId('form-status').textContent = '加强提醒的阈值需要大于首次提醒。'; return;
       }
-      config = C.settings(next); dismissed = 0; ignored = false; snoozeUntil = 0;
+      config = C.settings(next); highestStage = 0; dismissed = 0; ignored = false; snoozeUntil = 0;
       await save();
     });
     byId('reset').addEventListener('click', async () => {
-      config = C.settings(); dismissed = 0; ignored = false; snoozeUntil = 0; syncForm(); await save();
+      config = C.settings(); highestStage = 0; dismissed = 0; ignored = false; snoozeUntil = 0; syncForm(); await save();
     });
     async function save() {
       try { await chrome.storage.local.set({ cwmSettingsV2: config }); storageFailed = false; }
@@ -188,7 +202,11 @@
       config = C.settings(value.cwmSettingsV2); syncForm(); render();
     }).catch(() => { storageFailed = true; render(); });
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area === 'local' && changes.cwmSettingsV2) { config = C.settings(changes.cwmSettingsV2.newValue); syncForm(); render(); }
+      if (area === 'local' && changes.cwmSettingsV2) {
+        const next = C.settings(changes.cwmSettingsV2.newValue);
+        if (JSON.stringify(next) !== JSON.stringify(config)) { highestStage = 0; dismissed = 0; ignored = false; snoozeUntil = 0; }
+        config = next; syncForm(); render();
+      }
     });
     observer = new MutationObserver(mutations => {
       if (mutations.every(m => root.contains(m.target))) return;

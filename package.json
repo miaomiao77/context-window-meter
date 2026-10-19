@@ -5,6 +5,7 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "test:browser": "node test/browser.cjs",
-    "package": "python3 scripts/package.py"
+    "package": "python3 scripts/package.py",
+    "test:dom": "node test/dom.cjs"
   }
 }

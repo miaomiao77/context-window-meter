@@ -1,73 +1,57 @@
-# Context Window Meter for ChatGPT
+# Context Window Meter · 接续提醒器
 
-A Chrome extension (Manifest V3) that shows, in real time, how much of the model's context window your ChatGPT conversation is actually using — total tokens, the model's limit, the percentage, and a breakdown of what is filling it.
+个人维护的 ChatGPT 浏览器扩展 fork，基于原 Context Window Meter 改造。当前版本 **2.0.0**，非 OpenAI 官方产品。
 
-Everything runs locally in the tab. No data leaves your browser, nothing is stored, and the extension can only access `chatgpt.com`. See the [privacy policy](PRIVACY.md).
+目标是在长对话中提醒你提前整理接续信息。**没有可靠的官方剩余容量信号，不能保证在触顶前提醒。** 本扩展不再显示“已占用模型窗口百分比”“剩余 token”或预计剩余轮数。
 
-> Independent project — not affiliated with, endorsed by, or sponsored by OpenAI. "ChatGPT" is a trademark of OpenAI.
+## 使用
 
-## Why
+见 [INSTALL.md](INSTALL.md)。解压发布包，用桌面 Chromium 浏览器的“加载已解压的扩展程序”安装。只在 `https://chatgpt.com/*` 工作。
 
-ChatGPT gives you no indication of how full the context window is. You find out by hitting the limit: the model starts forgetting the top of the conversation, or silently truncates a long document you pasted. This puts a number on it before that happens — and shows *which* part of the conversation is eating the budget, which is usually not the part you'd guess.
+页面右下角出现“接续”按钮，点击展开。首次使用建议进入提醒设置：
 
-## Features
+- **自动识别**为默认；来源未知时不触发规模提醒。如你确认正在用 Chat，可选“手动指定 Chat”。
+- **Work 不套用 Chat 阈值**；若观察到 Work 来源，即使手动指定 Chat 也会停用规模提醒。
+- 首次默认 50 条用户消息或 40,000 个可读取字符；加强默认 100 条或 80,000 字符。任一到达即触发。它们只是可调整的提醒起点，未经真实触顶样本校准，不是官方上限。
+- 提醒一旦触发，本次查看不会因局部统计变小而自动撤回；切换对话或修改阈值会重置。
+- 可收起当前级别、稍后 30 分钟提醒、或本次查看不再提醒。关闭/刷新/切换对话会清除临时忽略状态；设置保留。
+- 本版不提供接续摘要按钮，不自动发送消息、开新对话或操作剪贴板。
 
-- **Live token count** against the active model's context limit, as a percentage
-- **Category breakdown** — your messages, ChatGPT's replies, tool and search results, reasoning traces, and system instructions
-- **Follows ChatGPT's own theme** — inherits the site's CSS custom properties, so light/dark and typography match with no configuration
-- **Honest loading state** — the badge shows a skeleton until it has actually measured the conversation, so it never reports a `0%` it hasn't verified
-- **No configuration, no account, no network calls**
+## 读数意味着什么
 
-## Install
+“已读取当前分支快照”：从网页正常取得的 conversation JSON 沿 `current_node` 的父节点回溯，仅统计当前分支。缺失节点、未知叶节点或环会拒绝该快照，不把全树当作当前分支。
 
-### From the Chrome Web Store
+发送新消息、可疑分支变化、编辑/重新生成相关交互后，旧快照失效，改用**当前页面可见内容**。这是局部统计，虚拟滚动、折叠内容、工具结果和附件可能遗漏。网页下一次自然载入有效快照后，恢复分支统计；扩展不主动刷新或请求历史。
 
-_Listing pending review — link will go here once published._
+字符按 Unicode 码点计数；用户消息数不等于“完整问答轮数”。token 为逐消息、多语言启发式估算：ASCII 字符 / 4、CJK 字符 × 1.5、其他非 ASCII 码点 × 2，向上取整。它不是 tokenizer，不计未返回的系统提示、内部推理、图片/音频编码或服务端处理后的真实上下文。返回的思考摘要也不等于全部 reasoning token。
 
-### From source
+## 网站限制信号
 
-1. Clone this repository.
-2. Open `chrome://extensions/`.
-3. Enable **Developer mode** (top-right).
-4. Click **Load unpacked** and select the repository root.
-5. Open any conversation on `https://chatgpt.com/`.
+被动观察已有同源 `fetch`：conversation 详情 GET、init JSON、发送 JSON/SSE，包括已知 `conversation_detail_metadata` 包装。
 
-## How it works
+| 观测 | 显示语义 |
+| --- | --- |
+| `conversation_too_large` | 网站返回会话容量限制 |
+| `context-truncation-block` | 网站返回上下文截断限制提示 |
+| `work_usage_limit_exceeded` / `model_cap_exceeded` | 使用额度，不等于会话容量 |
+| `input_too_large` | 本次输入/上下文过长，不能认定永久终止 |
+| `is_read_only` | 只读，原因未知 |
 
-1. **Response interception** — a `MAIN`-world script wraps the page's own `fetch` so it can read the `/backend-api/conversation/{id}` JSON that ChatGPT already loads. No extra requests are made.
-2. **Branch walk** — the conversation is a tree, not a list. Only the active branch from the root to `current_node` counts toward the context window, so the parser walks that path and ignores edited-away siblings.
-3. **Token estimation** — subword BPE estimation across message categories, including content types that are easy to forget: reasoning traces, tool output, file search results, and the user profile / custom instructions block.
-4. **Badge** — a pill in the bottom-right, expanding on click into the category breakdown.
+显示的是**收到过的状态**，不保证仍然有效；没有观测到也不等于有剩余空间。本版不观察 WebSocket，不覆盖所有传输路径。Request 对象携带但无法直接读取的请求体不会被克隆；缺少可靠会话关联时宁可不显示信号。网站协议、实验和 DOM 变化都可能影响观察。
 
-## Development
+## 权限与隐私
 
-```bash
-npm test              # node --test, no dependencies
-npm run package       # writes dist/extension.zip for store upload
-```
+唯一 API 权限 `storage`，只保存提醒设置；内容脚本匹配仅限 ChatGPT。无 `tabs`、`cookies`、`webRequest`、`scripting`、额外 `host_permissions`。无遥测、上传、远程脚本、运行时 npm 依赖。见 [PRIVACY.md](PRIVACY.md)。
 
-Icons are generated from `icons/icon.svg`:
+MAIN 世界与页面共享环境，消息桥不是可信安全边界；UI只接受固定枚举与有界数字，页面仍可能伪造读数。扩展不会因桥消息执行请求、写入聊天内容或运行代码。
 
-```bash
-for s in 16 48 128; do rsvg-convert -w $s -h $s icons/icon.svg -o icons/icon$s.png; done
-```
+## 开发与验证
 
-### Styling
+- `npm test`：Node 内置测试运行器，无需安装依赖。
+- `npm run package`：Python 标准库生成只包含运行文件和说明的 ZIP，不包含 fixtures、测试、git 历史。
+- `npm run test:browser`：可选 Chromium 回归，需要开发环境安装 Playwright 和浏览器；生产包不包含它们。
+- [实施检查点](docs/IMPLEMENTATION_STATUS.md)、[测试与边界](docs/VALIDATION.md)。
 
-`styles.css` is hand-written and needs no build step. It is scoped entirely to the two injected roots and inherits ChatGPT's own CSS custom properties (`--text-primary`, `--main-surface-primary`, `--border-light`, …), so the widget follows the site's theme and typeface with no JavaScript. Each `var()` carries a fallback in case OpenAI renames a token.
+调查日期 2026-10-19。下一步优先观察自然触顶样本，以最小元数据分别校准 Chat/Work；本版尚未加入持久统计采集，不故意刷消息触顶。
 
-### Test fixtures
-
-`test/fixtures/conversation-sample.json` is a **scrubbed** capture. The graph structure, content types, and message sizes are real; all free text, URLs, and account fields are synthetic.
-
-**Never commit a raw capture from your own account.** A ChatGPT conversation response embeds your email address, user ID, avatar URL, and the full text of the conversation. `.gitignore` blocks the common filenames, but the safe habit is to scrub before the file ever enters the working tree.
-
-## Caveats
-
-- Token counts are **estimates**. BPE estimation without the real tokenizer lands close but not exact.
-- The extension depends on ChatGPT's internal response shape, which OpenAI can change without notice. If the badge stops updating, that is the likely cause.
-- Context limits are inferred from the model slug and may lag behind new model releases.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+原项目版权和 MIT 许可保留在 [LICENSE](LICENSE)。

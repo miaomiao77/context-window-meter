@@ -35,3 +35,11 @@ Work usage / model cap / input too large / read-only 不能等同会话容量耗
 已写 core.js、page_script.js、content.js、styles.css，manifest 2.0.0。仅本机 storage 设置权限，移除冗余 host_permissions。
 后续：替换旧百分比测试，验证 SSE/JSON 错误分流、异步导航、设置持久化、浏览器加载；修复测试发现问题后打包。
 已知实现边界：发送后快照失效，改用明确标注的 DOM 局部统计；新历史快照到达才恢复完整分支计数。没有 WebSocket 拦截。自动模式无法确认 Chat 时需要手动指定。
+
+### 检查点 3：核心测试通过，浏览器执行受环境限制
+17 项 Node 核心测试通过。正常下载官方 Chrome for Testing 后，启动被当前执行环境拒绝 Unix socket（Operation not permitted），尚未完成真实 Chromium 扩展加载验证，不绕过限制。正在补做模拟 DOM 交互测试；浏览器回归脚本 test/browser.cjs 可在允许运行 Chromium 的开发环境执行。安装、隐私、打包脚本已完成。
+
+### 最终检查点：2.0.0 可安装候选版
+17 项核心测试及模拟 DOM 交互回归通过；修复了导航时旧 DOM 残留、响应副本异常清理、DOM 根 ID 冲突等问题。真实 Chromium 因环境 socket 限制未能启动，详见 VALIDATION.md，尚未经过真实账号网站验收。
+已移除不可靠容量百分比，提供两级可调提醒、手动 Chat 模式、已知服务端限制分类及最小本机设置存储。接续按钮按用户要求未做。
+交付包含安装包、INSTALL.md 和独立分支；主分支不变。下一步是用户安装验收/可运行浏览器环境的回归，不应重新调查全部前端代码或重复旧审计。
