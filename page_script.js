@@ -1,300 +1,124 @@
+/* Runs in MAIN solely to observe existing same-origin fetch responses. */
 (function () {
-  if (window.__chatgpt_token_tracker_injected) return;
-  window.__chatgpt_token_tracker_injected = true;
-
-  console.log('[ChatGPT Token Tracker] Injected into MAIN world context.');
-
-  const MODEL_CONTEXT_LIMITS = {
-    'gpt-5-6-thinking': 200000,
-    'gpt-5': 200000,
-    'o1': 200000,
-    'o1-preview': 128000,
-    'o1-mini': 128000,
-    'o3-mini': 200000,
-    'gpt-4o': 128000,
-    'gpt-4o-mini': 128000,
-    'gpt-4-turbo': 128000,
-    'gpt-4': 8192,
-    'gpt-3.5-turbo': 16384,
-    'default': 128000
-  };
-
-  function estimateTokens(text) {
-    if (!text || typeof text !== 'string') return 0;
-    const words = text.match(/\w+/g) || [];
-    const nonWords = text.match(/[^\w\s]+/g) || [];
-    const estimated = Math.ceil(words.length * 1.3 + nonWords.length * 1.1 + (text.length * 0.05));
-    return Math.max(0, Math.round(estimated));
-  }
-
-  function getContextLimit(modelSlug) {
-    if (!modelSlug) return MODEL_CONTEXT_LIMITS['default'];
-    const slug = modelSlug.toLowerCase();
-    for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
-      if (slug.includes(key)) return limit;
-    }
-    return MODEL_CONTEXT_LIMITS['default'];
-  }
-
-  function dispatchTokenUpdate(textByRole, modelSlug) {
-    let totalTokens = 0;
-    const breakdown = {};
-
-    for (const [role, text] of Object.entries(textByRole)) {
-      const tokens = estimateTokens(text);
-      breakdown[role] = tokens;
-      totalTokens += tokens;
-    }
-
-    if (totalTokens === 0) return;
-
-    const limit = getContextLimit(modelSlug);
-    const percentage = Math.min(100, (totalTokens / limit) * 100);
-
-    console.log(`[ChatGPT Token Tracker] Validated Token Count: ${totalTokens} tokens (${percentage.toFixed(1)}%) for ${modelSlug}`);
-
-    window.postMessage(
-      {
-        type: 'CHATGPT_TOKEN_USAGE_UPDATE',
-        data: {
-          totalTokens,
-          limit,
-          percentage: parseFloat(percentage.toFixed(2)),
-          modelSlug,
-          breakdown,
-          charCount: Object.values(textByRole).reduce((a, b) => a + b.length, 0),
-          updatedAt: new Date().toISOString()
-        }
-      },
-      '*'
-    );
-  }
-
-  function extractContentText(content) {
-    if (!content || typeof content !== 'object') return '';
-
-    const text = [];
-    const appendValue = value => {
-      if (typeof value === 'string') text.push(value);
-      else if (value && typeof value === 'object') text.push(JSON.stringify(value));
-    };
-
-    if (Array.isArray(content.parts)) content.parts.forEach(appendValue);
-    appendValue(content.text);
-    appendValue(content.result);
-    appendValue(content.content);
-    appendValue(content.summary);
-    appendValue(content.model_set_context);
-    appendValue(content.structured_context);
-    appendValue(content.repo_summary);
-    appendValue(content.repository);
-    appendValue(content.user_instructions);
-    appendValue(content.user_profile);
-
-    if (Array.isArray(content.thoughts)) {
-      for (const thought of content.thoughts) {
-        if (typeof thought === 'string') {
-          text.push(thought);
-          continue;
-        }
-        if (!thought || typeof thought !== 'object') continue;
-        appendValue(thought.summary);
-        appendValue(thought.content);
-        if (Array.isArray(thought.chunks)) thought.chunks.forEach(appendValue);
-      }
-    }
-
-    return text.join('\n');
-  }
-
-  function getMessageRole(message) {
-    const contentType = message.content?.content_type;
-    if (contentType === 'thoughts' || contentType === 'reasoning_recap') return 'thought';
-    if (contentType === 'model_editable_context') return 'system';
-
-    const role = message.author?.role || 'assistant';
-    if (role === 'tool' || role === 'system' || role === 'user') return role;
-    return 'assistant';
-  }
-
-  function getMessageModelSlug(message) {
-    return message.metadata?.model_slug ||
-      message.metadata?.resolved_model_slug ||
-      message.metadata?.default_model_slug ||
-      null;
-  }
-
-  function processJsonMapping(jsonObj) {
-    if (!jsonObj || typeof jsonObj !== 'object') return;
-    const mapping = jsonObj.mapping;
-    if (!mapping || typeof mapping !== 'object') return;
-
-    let modelSlug = jsonObj.default_model_slug || 'gpt-4o';
-    const textByRole = {
-      user: '',
-      assistant: '',
-      system: '',
-      tool: '',
-      thought: ''
-    };
-
-    const activeNodes = [];
-    const visitedNodeIds = new Set();
-    let nodeId = jsonObj.current_node;
-
-    while (nodeId && !visitedNodeIds.has(nodeId)) {
-      const node = mapping[nodeId];
-      if (!node) break;
-      activeNodes.push(node);
-      visitedNodeIds.add(nodeId);
-      nodeId = node.parent;
-    }
-
-    if (activeNodes.length > 0) activeNodes.reverse();
-    else activeNodes.push(...Object.values(mapping));
-
-    for (const node of activeNodes) {
-      const msg = node.message;
-      if (!msg) continue;
-
-      const targetRole = getMessageRole(msg);
-      const messageModelSlug = getMessageModelSlug(msg);
-      if (messageModelSlug) modelSlug = messageModelSlug;
-
-      textByRole[targetRole] += extractContentText(msg.content);
-    }
-
-    dispatchTokenUpdate(textByRole, modelSlug);
-  }
-
-  function processStreamText(fullText) {
-    let modelSlug = 'gpt-4o';
-    const textByRole = {
-      user: '',
-      assistant: '',
-      system: '',
-      tool: '',
-      thought: ''
-    };
-
-    const uniqueMessages = new Set();
-    const blocks = fullText.split(/\r?\n\r?\n/);
-
-    for (const blockStr of blocks) {
-      const lines = blockStr.split(/\r?\n/).filter(l => !l.startsWith(':'));
-      if (!lines.length) continue;
-
-      const dataLines = [];
-      for (const line of lines) {
-        if (line.startsWith('event:')) continue;
-        if (line.startsWith('data: ')) {
-          dataLines.push(line.slice(6));
-        } else if (line.startsWith('data:')) {
-          dataLines.push(line.slice(5));
-        } else {
-          dataLines.push(line);
-        }
-      }
-
-      let rawJson = dataLines.join('\n').trim();
-      if (!rawJson || rawJson === '[DONE]' || rawJson.startsWith('[DONE')) continue;
-
-      try {
-        const obj = JSON.parse(rawJson);
-        if (!obj || typeof obj !== 'object') continue;
-
-        if (obj.type === 'server_ste_metadata' && obj.metadata?.model_slug) {
-          modelSlug = obj.metadata.model_slug;
-        }
-
-        if (obj.input_message) {
-          const im = obj.input_message;
-          const targetRole = getMessageRole(im);
-          const messageModelSlug = getMessageModelSlug(im);
-          if (messageModelSlug) modelSlug = messageModelSlug;
-          textByRole[targetRole] += extractContentText(im.content);
-        }
-
-        const v = obj.v;
-        if (v && typeof v === 'object' && v.message) {
-          const msg = v.message;
-          const msgId = msg.id;
-          const messageModelSlug = getMessageModelSlug(msg);
-          if (messageModelSlug) modelSlug = messageModelSlug;
-
-          if (msgId && !uniqueMessages.has(msgId)) {
-            uniqueMessages.add(msgId);
-            const targetRole = getMessageRole(msg);
-            textByRole[targetRole] += extractContentText(msg.content);
-          }
-        }
-
-        const o = obj.o;
-        const p = obj.p;
-        if (o === 'append' && typeof v === 'string') {
-          if (p === '/message/content/thoughts') {
-            textByRole.thought += v;
-          } else if (p === '/message/content/text' || (p && p.includes('/message/content/parts/'))) {
-            textByRole.assistant += v;
-          }
-        } else if (o === 'append' && p === '/message/content/thoughts' && Array.isArray(v)) {
-          textByRole.thought += extractContentText({ thoughts: v });
-        }
-      } catch (e) {
-        // Skip incomplete chunk JSON
-      }
-    }
-
-    dispatchTokenUpdate(textByRole, modelSlug);
-  }
-
-  function handleStreamReader(streamReader) {
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
-
-    function read() {
-      streamReader.read().then(({ done, value }) => {
-        if (value) {
-          buffer += decoder.decode(value, { stream: true });
-          processStreamText(buffer);
-        }
-        if (!done) {
-          read();
-        } else {
-          buffer += decoder.decode();
-          processStreamText(buffer);
-        }
-      }).catch(err => {});
-    }
-
-    read();
-  }
-
-  function shouldIntercept(url) {
-    if (!url || typeof url !== 'string') return false;
-    return /^(?:https?:\/\/[^/]+)?\/backend-api\/conversation\/[^/?#]+\/?(?:[?#].*)?$/.test(url);
-  }
-
-  // Intercept fetch
+  'use strict';
+  if (window.__CWM_OBSERVER) return;
+  window.__CWM_OBSERVER = true;
+  const C = globalThis.__CWM_CORE;
   const originalFetch = window.fetch;
-  window.fetch = async function (...args) {
-    const response = await originalFetch.apply(this, args);
-
-    try {
-      const targetUrl = response.url || (typeof args[0] === 'string' ? args[0] : args[0]?.url || '');
-      if (shouldIntercept(targetUrl)) {
-        console.log('[ChatGPT Token Tracker] Target conversation fetch intercepted:', targetUrl);
-
-        response.clone().json().then(json => {
-          processJsonMapping(json);
-        }).catch(err => {
-          console.error('[ChatGPT Token Tracker] Conversation JSON parse error:', err);
-        });
-      }
-    } catch (err) {
-      console.error('[ChatGPT Token Tracker] Fetch intercept error:', err);
+  let path = location.pathname, epoch = 0, generation = 0;
+  let cached = null;
+  const cancellations = new Set();
+  function checkRoute() {
+    if (path !== location.pathname) {
+      path = location.pathname; epoch++; generation++; cached = null;
+      for (const cancel of cancellations) cancel();
+      cancellations.clear();
     }
-
-    return response;
+  }
+  function publish(packet) {
+    // Only computed counts, IDs for in-memory scoping, and fixed enums cross worlds.
+    cached = packet;
+    window.postMessage({ type: 'CWM_OBSERVATION_V2', packet }, location.origin);
+  }
+  window.addEventListener('message', event => {
+    if (event.source !== window || event.origin !== location.origin || event.data?.type !== 'CWM_READY_V2') return;
+    checkRoute();
+    if (cached) publish(cached);
+  });
+  async function readLimited(response, maximum, onChunk) {
+    const reader = response.body?.getReader();
+    if (!reader) return;
+    let stopped = false, size = 0;
+    const cancel = () => { stopped = true; reader.cancel().catch(() => {}); };
+    cancellations.add(cancel);
+    const timeout = setTimeout(cancel, 180000);
+    try {
+      while (!stopped) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maximum) { cancel(); throw new Error('observation-budget'); }
+        onChunk(value);
+      }
+      if (stopped) throw new Error('observation-incomplete');
+    } finally {
+      clearTimeout(timeout); cancellations.delete(cancel);
+      reader.releaseLock();
+    }
+  }
+  async function observe(response, info, context) {
+    let boundId = info.type === 'history' ? info.id : C.id(context.body?.conversation_id);
+    const requestMode = C.mode(context.body?.conversation_origin);
+    function valid(candidate) {
+      checkRoute();
+      const current = C.route(location.pathname);
+      // New chats may acquire their first URL during a response. Never adopt another existing chat.
+      if (epoch !== context.epoch) {
+        if (!(context.newChat && candidate && current === candidate && epoch === context.epoch + 1)) return false;
+      }
+      if (boundId && candidate && boundId !== candidate) return false;
+      if (!boundId && candidate) boundId = candidate;
+      return boundId ? current === boundId || (context.newChat && !current && epoch === context.epoch)
+        : context.hasBody && context.newChat && !current && epoch === context.epoch;
+    }
+    function inspect(obj) {
+      if (!obj || typeof obj !== 'object') return;
+      const candidate = C.id(obj.conversation_id) || C.id(obj.v?.conversation_id);
+      if (!valid(candidate)) return;
+      const detected = C.mode(obj.conversation_origin);
+      const packet = { conversationId: boundId, pathname: location.pathname,
+        mode: detected === 'unknown' ? requestMode : detected, observedAt: Date.now() };
+      if (info.type === 'history' && obj.mapping) {
+        if (generation !== context.generation) return; // A send superseded this history request.
+        const stats = C.snapshot(obj);
+        publish({ ...packet, type: 'snapshot', stats, signal: C.signal(obj) });
+        return;
+      }
+      // Known protocol envelopes only. Do not recurse into arbitrary chat text/objects.
+      const metadata = obj.type === 'conversation_detail_metadata' ? obj :
+        obj.v?.type === 'conversation_detail_metadata' ? obj.v : null;
+      const signal = C.signal(obj) || (metadata && (C.signal(metadata) || C.signal(metadata.metadata)));
+      if (signal || packet.mode !== 'unknown') publish({ ...packet, type: 'signal', signal });
+    }
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      let raw = ''; const decoder = new TextDecoder();
+      await readLimited(response.clone(), 24 * 1024 * 1024, bytes => { raw += decoder.decode(bytes, { stream: true }); });
+      raw += decoder.decode(); inspect(JSON.parse(raw));
+      raw = '';
+    } else if (contentType.includes('text/event-stream')) {
+      const decoder = new TextDecoder();
+      const parser = C.sseParser(inspect, () => { throw new Error('oversized-event'); });
+      await readLimited(response.clone(), 32 * 1024 * 1024, bytes => parser.push(decoder.decode(bytes, { stream: true })));
+      parser.push(decoder.decode()); parser.end();
+    }
+  }
+  window.fetch = function (...args) {
+    checkRoute();
+    let info = null, body = null;
+    try {
+      const input = args[0];
+      info = C.endpoint(typeof input === 'string' || input instanceof URL ? String(input) : input?.url, location.origin);
+      const raw = args[1]?.body;
+      if (info && typeof raw === 'string' && raw.length <= 4 * 1024 * 1024) body = JSON.parse(raw);
+    } catch { /* Observing must never block the host request. */ }
+    const context = { body, hasBody: !!body, epoch, generation,
+      newChat: !C.route(location.pathname) };
+    if (info?.type === 'send') {
+      generation++; context.generation = generation;
+      const cid = C.id(body?.conversation_id);
+      if ((cid && cid === C.route(location.pathname)) || (!cid && context.newChat && body)) {
+        publish({ type: 'stale', conversationId: cid, pathname: location.pathname,
+          mode: C.mode(body?.conversation_origin), observedAt: Date.now() });
+      }
+    }
+    // Preserve the original Promise/result/rejection and the page's body stream exactly.
+    const result = Reflect.apply(originalFetch, this, args);
+    if (info) result.then(response => {
+      // Redirects must stay on the same allowed origin and endpoint family.
+      if (response.url && !C.endpoint(response.url, location.origin)) return;
+      observe(response, info, context).catch(() => {});
+    }, () => {}).catch(() => {});
+    return result;
   };
 })();

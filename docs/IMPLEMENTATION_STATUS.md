@@ -29,3 +29,9 @@ Work usage / model cap / input too large / read-only 不能等同会话容量耗
 ## 恢复方法
 读取本文件、git status、最新提交及 test/；从当前阶段继续。
 阶段性提交保存到同名远程分支，不只保存在临时工作区。
+
+
+### 检查点 2：首版实现完成，尚未验证
+已写 core.js、page_script.js、content.js、styles.css，manifest 2.0.0。仅本机 storage 设置权限，移除冗余 host_permissions。
+后续：替换旧百分比测试，验证 SSE/JSON 错误分流、异步导航、设置持久化、浏览器加载；修复测试发现问题后打包。
+已知实现边界：发送后快照失效，改用明确标注的 DOM 局部统计；新历史快照到达才恢复完整分支计数。没有 WebSocket 拦截。自动模式无法确认 Chat 时需要手动指定。

@@ -1,9 +1,10 @@
 {
   "name": "context-window-meter",
-  "version": "1.0.1",
-  "description": "Chrome extension for real-time ChatGPT context window token usage",
+  "version": "2.0.0",
+  "description": "Local conversation-size observations and configurable continuation reminders",
   "scripts": {
-    "test": "node --test",
-    "package": "rm -f dist/extension.zip && mkdir -p dist && zip -r dist/extension.zip manifest.json content.js page_script.js styles.css icons -x '*.DS_Store' 'icons/icon.svg'"
+    "test": "node --test test/*.test.js",
+    "test:browser": "node test/browser.cjs",
+    "package": "python3 scripts/package.py"
   }
 }

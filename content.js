@@ -1,365 +1,204 @@
+/* Isolated-world UI. Only validated aggregate observations enter this world. */
 (function () {
-  let widgetContainer = null;
-  let detailsCard = null;
-  let isCardOpen = false;
-  let currentData = null;
-  // 'loading' until the conversation has actually been measured, so the badge
-  // never shows a 0% that looks like a real reading.
-  let status = 'loading';
-  let emptyStateTimer = null;
-
-  const EMPTY_STATE_DELAY_MS = 7000;
-
-  const CATEGORIES = [
-    { key: 'user', label: 'Your messages', color: 'var(--gtu-cat-user)' },
-    { key: 'assistant', label: 'ChatGPT replies', color: 'var(--gtu-cat-assistant)' },
-    { key: 'tool', label: 'Tool and search results', color: 'var(--gtu-cat-tool)' },
-    { key: 'thought', label: 'Reasoning', color: 'var(--gtu-cat-thought)' },
-    { key: 'system', label: 'System instructions', color: 'var(--gtu-cat-system)' }
-  ];
-
-  function estimateTokens(text) {
-    if (!text || typeof text !== 'string') return 0;
-    const words = text.match(/\w+/g) || [];
-    const nonWords = text.match(/[^\w\s]+/g) || [];
-    const estimated = Math.ceil(words.length * 1.3 + nonWords.length * 1.1 + (text.length * 0.05));
-    return Math.max(0, Math.round(estimated));
+  'use strict';
+  const C = globalThis.__CWM_CORE;
+  let config = C.settings(), pathname = location.pathname, detected = 'unknown';
+  let network = null, signal = null, stats = null, root, badge, panel, notice, observer;
+  let dismissed = 0, snoozeUntil = 0, ignored = false, scanTimer, open = false;
+  let lastObservation = 0, routeChangedAt = 0, storageFailed = false;
+  const byId = key => root.querySelector('#cwm-' + key);
+  const format = value => new Intl.NumberFormat('zh-CN').format(value || 0);
+  const LABELS = {
+    hard: '网站已返回会话容量限制，建议新开对话。',
+    context: '网站已返回上下文截断限制提示，请查看页面提供的后续操作。',
+    quota: '网站返回了使用额度限制。这不表示当前对话容量已满。',
+    input: '本次输入或请求上下文过长；尚不能判断对话已永久终止。',
+    readonly: '网站将此对话标为只读；原因未确认。'
+  };
+  function resetRoute() {
+    if (pathname === location.pathname) return false;
+    pathname = location.pathname; detected = 'unknown'; network = null; signal = null; stats = null;
+    dismissed = 0; snoozeUntil = 0; ignored = false; lastObservation = 0; routeChangedAt = Date.now();
+    render(); return true;
   }
-
-  function getStateColor(percentage) {
-    if (percentage < 50) return 'var(--gtu-ok)';
-    if (percentage < 80) return 'var(--gtu-warn)';
-    return 'var(--gtu-crit)';
+  function validStats(value) {
+    if (!value || !['chars', 'tokens', 'turns', 'messages'].every(key =>
+      Number.isSafeInteger(value[key]) && value[key] >= 0 && value[key] <= 1e10)) return null;
+    if (!Array.isArray(value.activeIds) || value.activeIds.length > 100000) return null;
+    if (!value.activeIds.every(x => C.id(x))) return null;
+    if (!C.id(value.branch)) return null;
+    const breakdown = {};
+    for (const role of C.ROLES) {
+      const n = value.breakdown?.[role];
+      if (!Number.isSafeInteger(n) || n < 0 || n > 1e10) return null;
+      breakdown[role] = n;
+    }
+    return { chars: value.chars, tokens: value.tokens, turns: value.turns, messages: value.messages,
+      omitted: value.omitted === true, activeIds: value.activeIds, branch: value.branch, breakdown,
+      source: 'history', complete: true };
   }
-
-  function formatNumber(num) {
-    return new Intl.NumberFormat().format(num || 0);
-  }
-
-  function formatCompact(num) {
-    if (!num) return '0';
-    if (num >= 1000) return Math.round(num / 1000) + 'k';
-    return String(num);
-  }
-
-  // `source` doubles as an internal precedence flag, so it gets a plain-language
-  // label at render time instead of leaking the flag name into the card.
-  function sourceLabel(source) {
-    if (source === 'Network SSE Stream') return 'Counted from the conversation';
-    return 'Estimated from the page';
-  }
-
-  function escapeHtml(value) {
-    return String(value == null ? '' : value)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-
-  function createWidget() {
-    if (widgetContainer) return;
-
-    widgetContainer = document.createElement('div');
-    widgetContainer.id = 'chatgpt-token-usage-badge';
-    widgetContainer.className = 'gpt-token-badge is-loading';
-    widgetContainer.setAttribute('role', 'button');
-    widgetContainer.setAttribute('tabindex', '0');
-    widgetContainer.setAttribute('aria-label', 'Context window usage. Reading conversation.');
-    widgetContainer.setAttribute('title', 'Context window usage');
-
-    widgetContainer.innerHTML = `
-      <div class="gpt-token-ring-container">
-        <svg class="gpt-token-ring" viewBox="0 0 36 36" aria-hidden="true">
-          <circle class="gpt-token-ring-track" cx="18" cy="18" r="15.9155" fill="none" stroke-width="3.5" />
-          <circle id="gpt-token-ring-path" class="gpt-token-ring-value" cx="18" cy="18" r="15.9155"
-            fill="none" stroke-width="3.5" stroke-linecap="round"
-            stroke-dasharray="25, 100" pathLength="100" />
-        </svg>
-        <span id="gpt-token-pct-text" class="gpt-token-ring-pct">0%</span>
-      </div>
-      <div class="gpt-token-badge-labels">
-        <span class="gpt-token-badge-title">Context</span>
-        <span id="gpt-token-count-text" class="gpt-token-badge-value">
-          <span class="gpt-token-skeleton" style="width: 4.5rem;"></span>
-        </span>
-      </div>
-    `;
-
-    detailsCard = document.createElement('div');
-    detailsCard.id = 'chatgpt-token-usage-details';
-    detailsCard.className = 'gpt-token-details-card hidden';
-    detailsCard.setAttribute('role', 'dialog');
-    detailsCard.setAttribute('aria-label', 'Context window breakdown');
-
-    document.body.appendChild(widgetContainer);
-    document.body.appendChild(detailsCard);
-
-    widgetContainer.addEventListener('click', (e) => {
-      e.stopPropagation();
-      isCardOpen = !isCardOpen;
-      renderDetailsCard();
-    });
-
-    widgetContainer.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' && e.key !== ' ') return;
-      e.preventDefault();
-      isCardOpen = !isCardOpen;
-      renderDetailsCard();
-    });
-
-    document.addEventListener('click', (e) => {
-      if (isCardOpen && !detailsCard.contains(e.target) && !widgetContainer.contains(e.target)) {
-        isCardOpen = false;
-        detailsCard.classList.add('hidden');
-      }
-    });
-
-    // A brand new chat has nothing to measure. Stop spinning and say so rather
-    // than loading forever.
-    if (typeof setTimeout === 'function') {
-      emptyStateTimer = setTimeout(() => {
-        if (status === 'loading') setStatus('empty');
-      }, EMPTY_STATE_DELAY_MS);
+  window.addEventListener('message', event => {
+    if (event.source !== window || event.origin !== location.origin || event.data?.type !== 'CWM_OBSERVATION_V2') return;
+    const p = event.data.packet;
+    if (!p || !['snapshot', 'signal', 'stale'].includes(p.type)) return;
+    resetRoute();
+    if (p.pathname !== pathname || (p.conversationId && p.conversationId !== C.route(pathname))) return;
+    if (!Number.isFinite(p.observedAt) || p.observedAt < lastObservation) return;
+    lastObservation = p.observedAt;
+    if (['chat', 'work'].includes(p.mode)) detected = p.mode;
+    // Fixed allowlist: never render a page-provided message, HTML, model/account name, or URL.
+    if (p.signal && C.signal(p.signal.code === 'context-truncation-block' ?
+      { banner_info: { name: p.signal.code } } : p.signal.code === 'is_read_only' ?
+      { is_read_only: true } : { code: p.signal.code })) {
+      const canonical = C.signal(p.signal.code === 'context-truncation-block' ?
+        { banner_info: { name: p.signal.code } } : p.signal.code === 'is_read_only' ?
+        { is_read_only: true } : { code: p.signal.code });
+      // Do not let a later quota error hide a known conversation stop.
+      if (!signal || !['hard', 'context'].includes(signal.kind) || ['hard', 'context'].includes(canonical.kind)) signal = canonical;
     }
-  }
-
-  function setStatus(next) {
-    status = next;
-    if (!widgetContainer) return;
-
-    if (next === 'loading') {
-      widgetContainer.classList.add('is-loading');
-      widgetContainer.setAttribute('aria-label', 'Context window usage. Reading conversation.');
-      return;
-    }
-
-    widgetContainer.classList.remove('is-loading');
-
-    if (next === 'empty') {
-      const countText = document.getElementById('gpt-token-count-text');
-      const pctText = document.getElementById('gpt-token-pct-text');
-      const ringPath = document.getElementById('gpt-token-ring-path');
-      if (ringPath) ringPath.setAttribute('stroke-dasharray', '0, 100');
-      if (pctText) pctText.innerText = '0%';
-      if (countText) countText.innerText = 'Empty';
-      widgetContainer.setAttribute('aria-label', 'Context window usage. No messages yet.');
-      if (isCardOpen) renderDetailsCard();
-    }
-  }
-
-  function updateWidgetUI(data) {
-    createWidget();
-    currentData = data;
-
-    if (emptyStateTimer && typeof clearTimeout === 'function') {
-      clearTimeout(emptyStateTimer);
-      emptyStateTimer = null;
-    }
-    setStatus('ready');
-
-    const ringPath = document.getElementById('gpt-token-ring-path');
-    const pctText = document.getElementById('gpt-token-pct-text');
-    const countText = document.getElementById('gpt-token-count-text');
-    const color = getStateColor(data.percentage);
-
-    if (ringPath) {
-      ringPath.setAttribute('stroke-dasharray', `${data.percentage}, 100`);
-      ringPath.setAttribute('stroke', color);
-    }
-
-    if (pctText) {
-      pctText.innerText = `${Math.round(data.percentage)}%`;
-    }
-
-    if (countText) {
-      countText.innerText = `${formatNumber(data.totalTokens)} / ${formatCompact(data.limit)}`;
-    }
-
-    widgetContainer.setAttribute(
-      'aria-label',
-      `Context window ${Math.round(data.percentage)} percent used, ${formatNumber(data.totalTokens)} of ${formatNumber(data.limit)} tokens.`
-    );
-
-    if (isCardOpen) {
-      renderDetailsCard();
-    }
-  }
-
-  function renderSegments(breakdown, limit) {
-    return CATEGORIES.map(category => {
-      const tokens = breakdown[category.key] || 0;
-      if (tokens <= 0) return '';
-      const width = Math.min(100, (tokens / limit) * 100);
-      return `<div class="gpt-token-bar-segment" style="width: ${width}%; background-color: ${category.color};" title="${escapeHtml(category.label)}"></div>`;
-    }).join('');
-  }
-
-  function renderLegend(breakdown, totalTokens) {
-    return CATEGORIES.map(category => {
-      const tokens = breakdown[category.key] || 0;
-      const share = totalTokens > 0 ? Math.round((tokens / totalTokens) * 100) : 0;
-      return `
-        <div class="gpt-token-row${tokens === 0 ? ' is-empty' : ''}">
-          <span class="gpt-token-swatch" style="background-color: ${category.color};"></span>
-          <span class="gpt-token-row-name">${escapeHtml(category.label)}</span>
-          <span class="gpt-token-row-value">${formatNumber(tokens)}</span>
-          <span class="gpt-token-row-share">${share}%</span>
-        </div>
-      `;
-    }).join('');
-  }
-
-  function renderDetailsCard() {
-    if (!detailsCard) return;
-
-    if (!isCardOpen) {
-      detailsCard.classList.add('hidden');
-      return;
-    }
-
-    detailsCard.classList.remove('hidden');
-
-    if (!currentData) {
-      detailsCard.innerHTML = `
-        <div class="gpt-token-card-head">
-          <span class="gpt-token-card-title">Context window</span>
-        </div>
-        ${status === 'loading' ? `
-          <div class="gpt-token-headline-sub">Reading this conversation…</div>
-          <span class="gpt-token-skeleton" style="width: 100%; height: 0.5rem; margin-top: 0.75rem;"></span>
-          <div class="gpt-token-legend">
-            <span class="gpt-token-skeleton" style="width: 70%; margin-bottom: 0.75rem;"></span>
-            <span class="gpt-token-skeleton" style="width: 85%; margin-bottom: 0.75rem;"></span>
-            <span class="gpt-token-skeleton" style="width: 55%;"></span>
-          </div>
-        ` : `
-          <p class="gpt-token-empty">No messages yet. Send one and the breakdown appears here.</p>
-        `}
-      `;
-      return;
-    }
-
-    const color = getStateColor(currentData.percentage);
-    const breakdown = currentData.breakdown || {};
-    const remainingTokens = Math.max(0, currentData.limit - currentData.totalTokens);
-
-    detailsCard.innerHTML = `
-      <div class="gpt-token-card-head">
-        <span class="gpt-token-card-title">Context window</span>
-        <span class="gpt-token-model">${escapeHtml(currentData.modelSlug || 'gpt-4o')}</span>
-      </div>
-
-      <div class="gpt-token-headline">
-        <span class="gpt-token-headline-pct" style="color: ${color};">${Math.round(currentData.percentage)}%</span>
-        <span class="gpt-token-headline-note">used</span>
-      </div>
-      <div class="gpt-token-headline-sub">
-        ${formatNumber(currentData.totalTokens)} of ${formatNumber(currentData.limit)} tokens · ${formatNumber(remainingTokens)} left
-      </div>
-
-      <div class="gpt-token-bar">
-        ${renderSegments(breakdown, currentData.limit)}
-      </div>
-
-      <div class="gpt-token-legend">
-        <div class="gpt-token-legend-title">What is filling it</div>
-        ${renderLegend(breakdown, currentData.totalTokens)}
-      </div>
-
-      <div class="gpt-token-foot">
-        <span>${escapeHtml(sourceLabel(currentData.source))}</span>
-        <button id="gpt-token-close-btn" type="button">Close</button>
-      </div>
-    `;
-
-    document.getElementById('gpt-token-close-btn')?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      isCardOpen = false;
-      detailsCard.classList.add('hidden');
-    });
-  }
-
-  // Enhanced DOM Fallback Scanner
-  function scanDOMFallback() {
-    if (currentData && currentData.source === 'Network SSE Stream' && currentData.totalTokens > 0) return;
-
-    const articles = document.querySelectorAll('article');
-    let userText = '';
-    let assistantText = '';
-
-    if (articles.length > 0) {
-      articles.forEach(article => {
-        const isUser = article.querySelector('[data-message-author-role="user"]') || article.getAttribute('data-message-author-role') === 'user' || article.innerText.includes('You said:');
-        if (isUser) {
-          userText += article.innerText + '\n';
-        } else {
-          assistantText += article.innerText + '\n';
-        }
-      });
-    } else {
-      const userEls = document.querySelectorAll('[data-message-author-role="user"], .user-message');
-      const assistantEls = document.querySelectorAll('[data-message-author-role="assistant"], .markdown');
-      userEls.forEach(el => userText += el.innerText + '\n');
-      assistantEls.forEach(el => assistantText += el.innerText + '\n');
-    }
-
-    const userTokens = estimateTokens(userText);
-    const assistantTokens = estimateTokens(assistantText);
-    const totalTokens = userTokens + assistantTokens;
-
-    if (totalTokens > 0) {
-      const limit = 128000;
-      const percentage = Math.min(100, (totalTokens / limit) * 100);
-
-      console.log(`[ChatGPT Token Tracker] DOM Scan Fallback: ${totalTokens} tokens (${percentage.toFixed(1)}%) from ${articles.length} articles`);
-
-      updateWidgetUI({
-        totalTokens,
-        limit,
-        percentage: parseFloat(percentage.toFixed(2)),
-        modelSlug: 'gpt-4o',
-        breakdown: {
-          user: userTokens,
-          assistant: assistantTokens,
-          tool: 0,
-          thought: 0,
-          system: 0
-        },
-        source: 'Estimated from the page',
-        updatedAt: new Date().toISOString()
-      });
-    }
-  }
-
-  // Listen for real-time SSE network messages
-  window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    if (event.data && event.data.type === 'CHATGPT_TOKEN_USAGE_UPDATE') {
-      const data = event.data.data;
-      data.source = 'Network SSE Stream';
-      updateWidgetUI(data);
-    }
+    if (p.type === 'snapshot') network = validStats(p.stats);
+    if (p.type === 'stale') network = null;
+    scheduleScan();
   });
-
+  function scan() {
+    scanTimer = null;
+    if (!root) return;
+    resetRoute();
+    // During SPA transitions the old DOM can briefly remain mounted. Wait for it to settle.
+    if (Date.now() - routeChangedAt < 700) { scheduleScan(750); return; }
+    const elements = [...document.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]')]
+      .filter(el => !root.contains(el) && !el.closest('[aria-hidden="true"]') && el.getClientRects().length > 0);
+    const ids = new Set(), values = [];
+    for (const el of elements) {
+      const messageId = C.id(el.getAttribute('data-message-id') || el.closest('[data-message-id]')?.getAttribute('data-message-id'));
+      if (messageId && ids.has(messageId)) continue;
+      if (messageId) ids.add(messageId);
+      values.push(C.messageStats({ author: { role: el.getAttribute('data-message-author-role') },
+        content: { parts: [el.innerText || ''] } }));
+    }
+    const visible = values.length ? { ...C.aggregate(values), source: 'dom', complete: false } : null;
+    // A changed branch/new stream invalidates a previously loaded active branch.
+    if (network && ids.size && [...ids].some(id => !network.activeIds.includes(id))) network = null;
+    // Never silently pin old history when streaming mutates an existing message ID.
+    if (network && visible && (visible.chars > network.chars || visible.turns > network.turns)) network = null;
+    stats = network || visible;
+    render();
+  }
+  function scheduleScan(delay = 300) {
+    if (scanTimer) return;
+    scanTimer = setTimeout(scan, delay);
+  }
+  function render() {
+    if (!root) return;
+    const currentMode = C.effectiveMode(detected, config.mode);
+    const stage = C.level(stats, config, detected);
+    const remind = stage > dismissed && !ignored && Date.now() >= snoozeUntil;
+    const strong = signal && ['hard', 'context'].includes(signal.kind);
+    const title = strong ? '网站限制' : remind ? (stage === 2 ? '建议准备接续' : '接续提醒') : '接续';
+    badge.textContent = `${title} · ${stats ? format(stats.turns) + ' 条' : '待观察'}`;
+    root.dataset.level = strong ? 'stop' : remind ? 'remind' : 'quiet';
+    byId('state').textContent = stats ? (stats.source === 'history' ? '已读取当前分支快照' : '当前页面可见内容 · 可能少算') : '尚未取得可测量内容';
+    byId('counts').textContent = stats ? `${format(stats.turns)} 条用户消息 · ${format(stats.chars)} 个字符` : '打开已有对话，或正常发送消息后观察。';
+    byId('estimate').textContent = stats ? `约 ${format(stats.tokens)} 个文本 token（启发式估算）` : '';
+    byId('coverage').textContent = stats?.source === 'history'
+      ? '快照包含接口提供的当前分支文本；不等于模型实际输入。未返回的系统内容、内部推理和附件编码无法计量。'
+      : '仅统计已呈现在页面上的用户与助手文本；折叠、虚拟滚动、工具结果和附件可能遗漏。刷新页面有机会取得完整分支快照。';
+    byId('mode-label').textContent = currentMode === 'work' ? 'Work：不套用 Chat 提醒阈值' : currentMode === 'chat'
+      ? (detected === 'chat' ? 'Chat：按来源识别' : 'Chat：手动指定；若识别出 Work 会停用提醒')
+      : '模式未确认：请在设置中指定 Chat 后启用规模提醒。';
+    byId('server').hidden = !signal;
+    byId('server').textContent = signal ? LABELS[signal.kind] : '';
+    byId('observed').textContent = signal ? `观测到：${signal.code}。这里只记录收到过的状态，不保证它仍然有效。` : '暂未观测到已知限制信号；这不代表还剩多少容量。';
+    byId('reminder-text').textContent = stage === 2 ? '对话已经很长，可以先整理接续信息，避免突然无法继续。' : '到了你设定的提醒点，可以开始准备接续信息。';
+    notice.hidden = !remind;
+    byId('notice-text').textContent = stage === 2 ? '建议准备接续信息' : '到了接续提醒点';
+    byId('reminder-box').hidden = !stage || ignored || Date.now() < snoozeUntil;
+    byId('preferences-note').textContent = storageFailed ? '设置暂时无法保存，当前页面仍可使用。' : '只在本机保存设置，不保存聊天内容或会话记录。';
+    const labels = { user: '用户', assistant: '助手', tool: '工具', reasoning: '返回的思考摘要', system: '返回的上下文/系统', developer: '开发者', other: '其他' };
+    byId('breakdown').replaceChildren();
+    if (stats) for (const role of C.ROLES) {
+      if (!stats.breakdown[role]) continue;
+      const item = document.createElement('li');
+      item.textContent = `${labels[role]}：约 ${format(stats.breakdown[role])} token`;
+      byId('breakdown').appendChild(item);
+    }
+  }
+  function setOpen(value) {
+    open = value; panel.hidden = !value; badge.setAttribute('aria-expanded', String(value));
+    if (value) byId('close').focus(); else badge.focus();
+  }
+  function syncForm() {
+    for (const key of Object.keys(C.DEFAULTS)) {
+      const input = root.querySelector(`[name="${key}"]`);
+      if (key === 'enabled') input.checked = config[key]; else input.value = config[key];
+    }
+  }
   function init() {
-    createWidget();
-    scanDOMFallback();
-
-    const observer = new MutationObserver(mutations => {
-      const onlyTrackerMutations = mutations.length > 0 && mutations.every(mutation =>
-        widgetContainer?.contains(mutation.target) || detailsCard?.contains(mutation.target)
-      );
-      if (onlyTrackerMutations) return;
-
-      scanDOMFallback();
+    root = document.createElement('section'); root.id = 'cwm-reminder';
+    root.setAttribute('aria-label', '接续提醒器');
+    root.innerHTML = `
+      <div id="cwm-notice" hidden><span id="cwm-notice-text" role="status"></span><button id="cwm-notice-open" type="button">查看</button><button id="cwm-dismiss" type="button" aria-label="收起本级提醒">×</button></div>
+      <button id="cwm-badge" type="button" aria-expanded="false" aria-controls="cwm-panel">接续 · 待观察</button>
+      <div id="cwm-panel" role="dialog" aria-label="对话规模与接续提醒" hidden>
+        <header><strong>接续提醒器</strong><button id="cwm-close" type="button" aria-label="关闭面板">×</button></header>
+        <p id="cwm-state"></p><p id="cwm-counts" class="cwm-counts"></p><p id="cwm-estimate"></p>
+        <p id="cwm-mode-label" class="cwm-muted"></p>
+        <div id="cwm-reminder-box" class="cwm-callout" hidden><p id="cwm-reminder-text"></p><div class="cwm-buttons"><button id="cwm-snooze" type="button">30 分钟后提醒</button><button id="cwm-ignore" type="button">本次查看不再提醒</button></div></div>
+        <p id="cwm-server" class="cwm-callout" hidden></p><p id="cwm-observed" class="cwm-muted"></p>
+        <details><summary>统计范围与局限</summary><p id="cwm-coverage"></p><ul id="cwm-breakdown"></ul><p>没有可靠的官方剩余容量信号，不能预测必然触顶时间。可见历史、模型上下文和会话硬上限不是同一项指标。</p><p>仅观察网页已有的 fetch JSON/SSE；不观察 WebSocket，不主动请求接口。页面更新可能使观察失效。</p></details>
+        <details><summary>提醒设置</summary><form id="cwm-settings">
+          <label class="cwm-check"><input name="enabled" type="checkbox">启用规模提醒</label>
+          <label>提醒模式<select name="mode"><option value="auto">自动识别（未知时不提醒）</option><option value="chat">手动指定 Chat</option><option value="work">Work（不评估容量）</option></select></label>
+          <div class="cwm-grid"><label>首次：用户消息数<input name="firstTurns" type="number" min="1" max="99999" required></label><label>加强：用户消息数<input name="secondTurns" type="number" min="2" max="100000" required></label><label>首次：字符数<input name="firstChars" type="number" min="1000" max="99999000" step="1000" required></label><label>加强：字符数<input name="secondChars" type="number" min="2000" max="100000000" step="1000" required></label></div>
+          <p class="cwm-muted">消息数或字符数任一到达就提醒。默认 50 / 100 条、4万 / 8万字符是可调整的起点，未经触顶样本校准，不是官方上限。手动模式应用于所有页面；明确识别为 Work 时不使用 Chat 阈值。</p>
+          <div class="cwm-buttons"><button type="submit">保存设置</button><button id="cwm-reset" type="button">恢复默认</button></div><p id="cwm-form-status" role="status"></p>
+        </form></details><p id="cwm-preferences-note" class="cwm-muted"></p>
+      </div>`;
+    document.body.appendChild(root);
+    badge = byId('badge'); panel = byId('panel'); notice = byId('notice');
+    badge.addEventListener('click', () => setOpen(!open));
+    byId('close').addEventListener('click', () => setOpen(false));
+    byId('notice-open').addEventListener('click', () => setOpen(true));
+    byId('dismiss').addEventListener('click', () => { dismissed = C.level(stats, config, detected); render(); });
+    byId('snooze').addEventListener('click', () => { snoozeUntil = Date.now() + 1800000; render(); });
+    byId('ignore').addEventListener('click', () => { ignored = true; render(); });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape' && open) setOpen(false); });
+    document.addEventListener('click', event => { if (open && !root.contains(event.target)) setOpen(false); });
+    byId('settings').addEventListener('submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const next = { enabled: form.elements.enabled.checked, mode: form.elements.mode.value };
+      for (const key of ['firstTurns', 'secondTurns', 'firstChars', 'secondChars']) next[key] = Number(form.elements[key].value);
+      if (next.secondTurns <= next.firstTurns || next.secondChars <= next.firstChars) {
+        byId('form-status').textContent = '加强提醒的阈值需要大于首次提醒。'; return;
+      }
+      config = C.settings(next); dismissed = 0; ignored = false; snoozeUntil = 0;
+      await save();
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    byId('reset').addEventListener('click', async () => {
+      config = C.settings(); dismissed = 0; ignored = false; snoozeUntil = 0; syncForm(); await save();
+    });
+    async function save() {
+      try { await chrome.storage.local.set({ cwmSettingsV2: config }); storageFailed = false; }
+      catch { storageFailed = true; }
+      byId('form-status').textContent = storageFailed ? '未能保存，设置仅在本页面生效。' : '已保存。'; render();
+    }
+    syncForm(); scan();
+    chrome.storage.local.get('cwmSettingsV2').then(value => {
+      config = C.settings(value.cwmSettingsV2); syncForm(); render();
+    }).catch(() => { storageFailed = true; render(); });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes.cwmSettingsV2) { config = C.settings(changes.cwmSettingsV2.newValue); syncForm(); render(); }
+    });
+    observer = new MutationObserver(mutations => {
+      if (mutations.every(m => root.contains(m.target))) return;
+      scheduleScan();
+    });
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true,
+      attributes: true, attributeFilter: ['data-message-id', 'data-message-author-role', 'aria-hidden'] });
+    setInterval(() => { if (resetRoute()) scheduleScan(750); else render(); }, 1000);
+    window.postMessage({ type: 'CWM_READY_V2' }, location.origin);
   }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
+  else init();
 })();
