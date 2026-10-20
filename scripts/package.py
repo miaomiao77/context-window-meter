@@ -12,12 +12,12 @@ version = json.loads((root / 'manifest.json').read_text())['version']
 output = root / 'dist' / f'context-continuation-reminder-{version}.zip'
 output.parent.mkdir(exist_ok=True)
 files = ['manifest.json', 'page_script.js', 'content.js', 'styles.css',
-         'LICENSE', 'README.md', 'PRIVACY.md', 'INSTALL.md', 'docs/VALIDATION.md', 'docs/IMPLEMENTATION_STATUS.md', 'docs/PAGINATION_EVIDENCE.md',
+         'LICENSE', 'README.md', 'PRIVACY.md', 'INSTALL.md', 'docs/VALIDATION.md', 'docs/IMPLEMENTATION_STATUS.md', 'docs/PAGINATION_EVIDENCE.md', 'docs/SCAN_DESIGN.md',
          'icons/icon16.png', 'icons/icon48.png', 'icons/icon128.png']
 with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
     for name in files:
         data = (root / name).read_bytes()
-        info = zipfile.ZipInfo(name, date_time=(2026, 10, 19, 0, 0, 0))
+        info = zipfile.ZipInfo(name, date_time=(2026, 10, 20, 0, 0, 0))
         info.compress_type = zipfile.ZIP_DEFLATED
         info.external_attr = 0o100644 << 16
         archive.writestr(info, data)

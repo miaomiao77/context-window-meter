@@ -45,7 +45,7 @@ test('only a closed explicit mapping parent chain is verified, alternate branch 
 test('missing ancestor cannot become complete just because mapping response omits page_info', async () => {
   const head = { current_node:'a',mapping:{a:{parent:'missing',message:message('a')}} };
   const r=await setup([session(),head,head]).run();
-  assert.equal(r.status,'done'); assert.equal(r.stats.complete,false);
+  assert.equal(r.status,'stopped'); assert.equal(r.reason,'schema'); assert.equal(r.exhausted,false); assert.equal(r.stats.complete,false);
 });
 test('mapping fragments can join by explicit parent links across pages', async () => {
   const head={current_node:'a',mapping:{a:{parent:'u',message:message('a','assistant')}},page_info:{has_previous_page:true,start_cursor:'next'}};

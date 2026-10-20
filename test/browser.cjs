@@ -26,10 +26,19 @@ const html = `<!doctype html><html><meta charset="utf-8"><title>Mock ChatGPT</ti
     else options.channel = 'chromium';
     context = await chromium.launchPersistentContext(profile, options);
     const requests = [], errors = [];
+    let allowManual = false;
     let initReply = {}, sendReply = 'data: [DONE]\n\n', delayHistory = 0;
     await context.route('**/*', async route => {
       const request = route.request(), url = new URL(request.url()); requests.push(url.pathname);
       if (url.origin !== 'https://chatgpt.com') return route.abort();
+      if (url.pathname === '/api/auth/session') {
+        assert.equal(allowManual, true, 'no auth request without user click');
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ accessToken: 'synthetic-manual-token' }) });
+      }
+      if (url.pathname === '/backend-api/conversations/abc/messages') {
+        assert.equal(request.headers().authorization, 'Bearer synthetic-manual-token');
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ messages: [message('user', '较早的问题', 'older-u'), message('assistant', '较早的回答', 'older-a')], page_info: { has_previous_page: false } }) });
+      }
       if (url.pathname === '/backend-api/conversations/abc')
         return route.fulfill({ contentType: 'application/json', body: JSON.stringify(historyPage) });
       if (url.pathname === '/backend-api/conversation/abc') {
@@ -77,6 +86,23 @@ const html = `<!doctype html><html><meta charset="utf-8"><title>Mock ChatGPT</ti
     await page.waitForFunction(() => !document.querySelector('#cwm-notice').hidden);
     await page.locator('#cwm-snooze').click();
     assert.equal(await page.locator('#cwm-notice').isVisible(), false);
+    // Manual scanner requests live in ISOLATED, do not pass through MAIN fetch hook.
+    await page.reload(); await page.locator('#cwm-badge').click();
+    await page.evaluate(() => {
+      window.scanBridge = [];
+      window.addEventListener('message', e => { if (e.data?.type?.startsWith('CWM_')) window.scanBridge.push(e.data); });
+      document.querySelector('#cwm-scan-start').click(); // synthetic must be ignored
+    });
+    await page.waitForTimeout(100);
+    assert.equal(requests.includes('/api/auth/session'), false);
+    allowManual = true;
+    await page.locator('#cwm-scan-start').click();
+    await waitText('#cwm-scan-status', /完成：接口历史已读完/);
+    await waitText('#cwm-state', /分支关系未验证/);
+    assert.match(await page.locator('#cwm-counts').textContent(), /2 条用户消息/);
+    const bridgeText = await page.evaluate(() => JSON.stringify(window.scanBridge));
+    assert.equal(bridgeText.includes('synthetic-manual-token'), false);
+    assert.equal(bridgeText.includes('较早的问题'), false);
     // Mode safety and quota distinction.
     initReply = { error_code: 'work_usage_limit_exceeded' };
     await init({ conversation_id: 'abc', conversation_origin: 'flora' });
@@ -112,9 +138,9 @@ const html = `<!doctype html><html><meta charset="utf-8"><title>Mock ChatGPT</ti
     // Optional visual artifact for internal QA only.
     if (process.env.CWM_SCREENSHOT) await page.screenshot({ path: process.env.CWM_SCREENSHOT });
     assert.deepEqual(errors, []);
-    // All requests were page navigation or explicit test actions; observer issued none.
-    assert.deepEqual([...new Set(requests)].sort(), ['/backend-api/conversation/abc', '/backend-api/conversation/init', '/backend-api/conversations/abc', '/backend-api/f/conversation', '/c/abc'].sort());
-    console.log('PASS: actual MV3 load; plural message page; settings persistence; staged/snoozed reminders; Work/quota separation; SSE original body; untrusted bridge; SPA races; mobile layout; no added requests.');
+    // All requests were page navigation, explicit page actions or the explicit manual scan. No third party endpoints.
+    assert.deepEqual([...new Set(requests)].sort(), ['/api/auth/session', '/backend-api/conversations/abc/messages', '/backend-api/conversation/abc', '/backend-api/conversation/init', '/backend-api/conversations/abc', '/backend-api/f/conversation', '/c/abc'].sort());
+    console.log('PASS: actual MV3 load; plural message page; trusted manual scan; isolated auth; settings persistence; staged/snoozed reminders; Work/quota separation; SSE original body; untrusted bridge; SPA races; mobile layout; no added requests.');
   } finally {
     await context?.close(); fs.rmSync(profile, { recursive: true, force: true });
   }

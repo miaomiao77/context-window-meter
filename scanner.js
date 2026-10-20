@@ -125,7 +125,7 @@ function createCWMScanner(C, env) {
       let more = data.page_info?.has_previous_page, cursor = data.page_info?.start_cursor;
       if (typeof more !== 'boolean') {
         if (kind !== 'mapping') fail('schema');
-        more = false; // Only explicit root/parent validation can make this mapping complete.
+        more = null; // No pagination metadata: only a closed parent chain proves an endpoint.
       }
       if (more && (typeof cursor !== 'string' || cursor.length < 1 || cursor.length > 4096)) fail('cursor');
       return { kind, current, items, more, cursor: more ? cursor : null };
@@ -149,7 +149,7 @@ function createCWMScanner(C, env) {
       order = [...next.map(e => e.id), ...order];
     }
     function verifiedBranch() {
-      if (!exhausted || format !== 'mapping' || !leaf) return false;
+      if (format !== 'mapping' || !leaf) return false;
       const seen = new Set(); let id = leaf;
       while (id) {
         if (seen.has(id) || !entries.has(id)) return false; seen.add(id);
@@ -172,7 +172,8 @@ function createCWMScanner(C, env) {
         const first = pages === 0;
         merge(page, first); pages++;
         if (first) firstSignature = signature(page);
-        exhausted = !page.more; report('reading');
+        exhausted = page.more === false || (page.more === null && verifiedBranch()); report('reading');
+        if (page.more === null && !exhausted) fail('schema');
         if (exhausted) break;
         if (cursors.has(page.cursor)) fail('cursor'); cursors.add(page.cursor);
         const next = new URL('/backend-api/conversations/' + conversationId + '/messages', 'https://chatgpt.com');

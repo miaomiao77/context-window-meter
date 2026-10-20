@@ -25,3 +25,5 @@
 #cwm-notice { display: flex; align-items: center; gap: 7px; padding: 7px 9px; margin-bottom: 8px; border: 1px solid var(--cwm-line); border-radius: 10px; background: var(--cwm-bg); box-shadow: 0 2px 16px #0001; }
 @media (prefers-color-scheme: dark) { #cwm-reminder { --cwm-bg: #202823; --cwm-fg: #e2e9e3; --cwm-line: #4c5c51; --cwm-soft: #303d33; --cwm-muted: #b1beb3; } }
 @media (max-width: 600px) { #cwm-reminder { right: 12px; bottom: 12px; } #cwm-panel { padding: 14px; } }
+
+#cwm-reminder button:disabled { opacity: .5; cursor: default; }

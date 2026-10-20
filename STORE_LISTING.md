@@ -1,10 +1,10 @@
 # Draft listing — not submitted
 Name: Context Window Meter · 接续提醒器
-Version: 2.0.2
+Version: 2.1.0
 
 Observe conversation size and set personal continuation reminders for ChatGPT.
 No capacity percentage or claimed remaining tokens. Local settings only.
-No upload, telemetry, remote executable code, or account access.
+No third-party upload, telemetry, or remote executable code. Manual scans use a temporary same-origin session token; not persisted.
 
 Permissions: storage for preferences; static content scripts only on https://chatgpt.com/*.
 Accuracy: heuristic text counts and partial observation; no guaranteed pre-cap warning.

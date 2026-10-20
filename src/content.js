@@ -36,7 +36,7 @@
       isCurrent: () => run === manualRun && location.pathname === scanPath,
       onUpdate: value => {
         if (run !== manualRun || location.pathname !== scanPath) return;
-        manual = value; manualStats = value.stats?.messages ? value.stats : null;
+        manual = value; manualStats = value.stats && value.pages > 0 && !['changed', 'conflict', 'scope', 'work'].includes(value.reason) ? value.stats : null;
         if (value.mode === 'work' || value.mode === 'chat') detected = value.mode;
         stats = manualStats || network; render();
       } });
@@ -78,6 +78,7 @@
     if (!Number.isFinite(p.observedAt) || p.observedAt < lastObservation) return;
     lastObservation = p.observedAt;
     if (['chat', 'work'].includes(p.mode)) detected = p.mode;
+    if (p.mode === 'work') invalidateManual('work');
     // Fixed allowlist: never render a page-provided message, HTML, model/account name, or URL.
     if (p.signal && C.signal(p.signal.code === 'context-truncation-block' ?
       { banner_info: { name: p.signal.code } } : p.signal.code === 'is_read_only' ?
@@ -146,7 +147,7 @@
     badge.textContent = `${title} · ${stats ? format(stats.turns) + ' 条' : '待观察'}`;
     root.dataset.level = strong ? 'stop' : remind ? 'remind' : 'quiet';
     byId('state').textContent = stats?.source === 'scan' ? (stats.complete ? '扫描完成 · 已核对返回分支父链' : manual?.status === 'done' ? '接口历史已读完 · 分支关系未验证' : '扫描已读取部分历史 · 尚不完整') : stats ? (stats.source === 'history' ? (stats.complete ? '已读取当前分支快照' : stats.coverage === 'message-page' ? '本页消息统计 · 非完整对话' : '当前分支片段 · 非完整对话') : '当前页面可见内容 · 可能少算') : '尚未取得可测量内容';
-    byId('counts').textContent = stats ? `${(stats.source === 'history' || stats.source === 'scan') && !stats.complete ? (stats.coverage === 'message-page' ? '本页 ' : '片段中 ') : ''}${format(stats.turns)} 条用户消息 · ${format(stats.chars)} 个字符` : '打开已有对话，或正常发送消息后观察。';
+    byId('counts').textContent = stats ? `${stats.source === 'scan' ? '扫描已读 ' : stats.source === 'history' && !stats.complete ? (stats.coverage === 'message-page' ? '本页 ' : '片段中 ') : ''}${format(stats.turns)} 条用户消息 · ${format(stats.chars)} 个字符` : '打开已有对话，或正常发送消息后观察。';
     byId('estimate').textContent = stats ? `约 ${format(stats.tokens)} 个文本 token（启发式估算）` : '';
     byId('coverage').textContent = stats?.source === 'scan'
       ? (stats.complete ? '已沿接口提供的父链核对到根，并复查首页未变；只代表这次返回的分支历史。' : '已按消息 ID 去重。消息数组缺少可核对的父链，不能把翻到最早一页当作完整 active branch 的证明。') + ' 扫描结果是当时快照；发送、编辑或切换分支后需重新扫描。不等于模型输入或剩余容量。'
@@ -251,7 +252,7 @@
       if (next.secondTurns <= next.firstTurns || next.secondChars <= next.firstChars) {
         byId('form-status').textContent = '加强提醒的阈值需要大于首次提醒。'; return;
       }
-      config = C.settings(next); highestStage = 0; dismissed = 0; ignored = false; snoozeUntil = 0;
+      config = C.settings(next); if (config.mode === 'work') invalidateManual('work'); highestStage = 0; dismissed = 0; ignored = false; snoozeUntil = 0;
       await save();
     });
     byId('reset').addEventListener('click', async () => {
@@ -270,7 +271,7 @@
       if (area === 'local' && changes.cwmSettingsV2) {
         const next = C.settings(changes.cwmSettingsV2.newValue);
         if (JSON.stringify(next) !== JSON.stringify(config)) { highestStage = 0; dismissed = 0; ignored = false; snoozeUntil = 0; }
-        config = next; syncForm(); render();
+        config = next; if (config.mode === 'work') invalidateManual('work'); syncForm(); render();
       }
     });
     observer = new MutationObserver(mutations => {
@@ -278,7 +279,9 @@
       // Changes inside a rendered message can mean streaming/editing, even at equal text length.
       if (manual && mutations.some(m => {
         const target = m.target.nodeType === 1 ? m.target : m.target.parentElement;
-        return target?.closest('[data-message-id], [data-message-author-role]');
+        return target?.closest('[data-message-id], [data-message-author-role]') ||
+          [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 &&
+            (n.matches('[data-message-id], [data-message-author-role]') || n.querySelector('[data-message-id], [data-message-author-role]')));
       })) invalidateManual();
       scheduleScan();
     });
