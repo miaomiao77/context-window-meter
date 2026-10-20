@@ -1,73 +1,92 @@
-# Context Window Meter for ChatGPT
+# Context Window Meter · 接续提醒器
 
-A Chrome extension (Manifest V3) that shows, in real time, how much of the model's context window your ChatGPT conversation is actually using — total tokens, the model's limit, the percentage, and a breakdown of what is filling it.
+个人维护的 ChatGPT 浏览器扩展 fork，基于原 Context Window Meter 改造。当前版本 **2.1.0**，非 OpenAI 官方产品。
 
-Everything runs locally in the tab. No data leaves your browser, nothing is stored, and the extension can only access `chatgpt.com`. See the [privacy policy](PRIVACY.md).
+目标是在长对话中提醒你提前整理接续信息。**没有可靠的官方剩余容量信号，不能保证在触顶前提醒。** 本扩展不再显示“已占用模型窗口百分比”“剩余 token”或预计剩余轮数。
 
-> Independent project — not affiliated with, endorsed by, or sponsored by OpenAI. "ChatGPT" is a trademark of OpenAI.
+## 使用
 
-## Why
+见 [INSTALL.md](INSTALL.md)。解压发布包，用桌面 Chromium 浏览器的“加载已解压的扩展程序”安装。只在 `https://chatgpt.com/*` 工作。
 
-ChatGPT gives you no indication of how full the context window is. You find out by hitting the limit: the model starts forgetting the top of the conversation, or silently truncates a long document you pasted. This puts a number on it before that happens — and shows *which* part of the conversation is eating the budget, which is usually not the part you'd guess.
+页面右下角出现“接续”按钮，点击展开。首次使用建议进入提醒设置：
 
-## Features
+- **自动识别**为默认；来源未知时不触发规模提醒。如你确认正在用 Chat，可选“手动指定 Chat”。
+- **Work 不套用 Chat 阈值**；若观察到 Work 来源，即使手动指定 Chat 也会停用规模提醒。
+- 首次默认 50 条用户消息或 40,000 个可读取字符；加强默认 100 条或 80,000 字符。任一到达即触发。它们只是可调整的提醒起点，未经真实触顶样本校准，不是官方上限。
+- 提醒一旦触发，本次查看不会因局部统计变小而自动撤回；切换对话或修改阈值会重置。
+- 可收起当前级别、稍后 30 分钟提醒、或本次查看不再提醒。关闭/刷新/切换对话会清除临时忽略状态；设置保留。
+- 本版不提供接续摘要按钮，不自动发送消息、开新对话或操作剪贴板。
 
-- **Live token count** against the active model's context limit, as a percentage
-- **Category breakdown** — your messages, ChatGPT's replies, tool and search results, reasoning traces, and system instructions
-- **Follows ChatGPT's own theme** — inherits the site's CSS custom properties, so light/dark and typography match with no configuration
-- **Honest loading state** — the badge shows a skeleton until it has actually measured the conversation, so it never reports a `0%` it hasn't verified
-- **No configuration, no account, no network calls**
+## 手动扫描（2.1.0）
 
-## Install
+打开已有 Chat 对话，展开右下角“接续”，点击 **扫描当前对话**。逐页向前读取，显示已读页数、消息数及进度；可随时取消。扫描期间请暂缓发消息、编辑、切分支或滚动加载历史；相关页面变化可能使扫描作废。
 
-### From the Chrome Web Store
+| 扫描结果 | 含义 |
+| --- | --- |
+| 扫描已读取部分历史 · 尚不完整 | 正在扫描、取消、失败或达到预算；只显示已成功读取部分 |
+| 接口历史已读完 · 分支关系未验证 | 沿分页游标读到 has_previous_page=false，复查首页未变；数组缺少明确父链，不等于已证明完整 active branch |
+| 扫描完成 · 已核对返回分支父链 | 接口提供 mapping，父链从目标叶节点闭合到根，替代分支排除，并复查首页未变；仍只是返回历史的快照 |
 
-_Listing pending review — link will go here once published._
+同一消息按 ID 去重；重复、冲突或没有推进的页不会无限读取。文本摘要哈希用于检查重叠内容是否变化，原文不跨页缓存。扫描结果仅在当前标签页内存中，刷新后消失；发送、编辑、换分支或换对话后需要重新扫描。没有已知叶节点时扫描服务器所选历史，不能承诺等于页面当前显示的分支。即使父链闭合，也不能证明跨页期间服务器没有任何未观察到的历史变动。
 
-### From source
+**与 2.0.2 的隐私差异：手动扫描会新增同源 GET。** 点击后读取 `/api/auth/session` 的临时 accessToken，在扩展隔离环境内向复数历史接口鉴权；完成、取消或失败后释放引用。不会传给 MAIN 页面消息桥、写入存储或日志。MAIN 桥不能启动扫描，合成点击被拒绝。默认不点击时仍仅被动观察。权限仍只有 storage，具体见 [PRIVACY.md](PRIVACY.md)。
 
-1. Clone this repository.
-2. Open `chrome://extensions/`.
-3. Enable **Developer mode** (top-right).
-4. Click **Load unpacked** and select the repository root.
-5. Open any conversation on `https://chatgpt.com/`.
+当前预算：每页请求 num_turns=10，页间至少 350ms；最多 500 页、100000 个节点、总响应 64 MiB、单历史响应 24 MiB、约 5 分钟，单请求超时 30 秒。401/403/429 或结构异常会停止，不自动重试或刷新登录。明确识别为 Work 时不执行这套 Chat 扫描。扫描终止不代表会话触顶。
 
-## How it works
+这使读数可以超出最近一页，但没有把统计变成官方剩余容量。未经校准的消息/字符提醒仍只是个人阈值。
 
-1. **Response interception** — a `MAIN`-world script wraps the page's own `fetch` so it can read the `/backend-api/conversation/{id}` JSON that ChatGPT already loads. No extra requests are made.
-2. **Branch walk** — the conversation is a tree, not a list. Only the active branch from the root to `current_node` counts toward the context window, so the parser walks that path and ignores edited-away siblings.
-3. **Token estimation** — subword BPE estimation across message categories, including content types that are easy to forget: reasoning traces, tool output, file search results, and the user profile / custom instructions block.
-4. **Badge** — a pill in the bottom-right, expanding on click into the category breakdown.
+## 读数意味着什么
 
-## Development
+不同读取来源会明确区分：
 
-```bash
-npm test              # node --test, no dependencies
-npm run package       # writes dist/extension.zip for store upload
-```
+- **已读取当前分支快照**：旧版单数接口返回的 `mapping`，沿 `current_node` 父链统计；不把替代分支或全树算进去。无分页依据时，断链、未知叶节点或环会拒绝该快照。
+- **本页消息统计 · 非完整对话**：复数 `/backend-api/conversations/{id}` 及其 `/messages` 分页接口返回 `messages + page_info`，只统计本次消息页，不展开其他版本。`num_turns=10` 是分页参数，不是整段对话只有 10 轮。
+- **当前分支片段 · 非完整对话**：有分页依据的 `mapping` 只回溯已返回的父链片段，允许边界父节点位于响应之外；仍拒绝未知叶节点与环。
+- **当前页面可见内容 · 可能少算**：没有可用网络快照、发送消息或检测到可疑分支变化后使用 DOM。虚拟滚动、折叠、工具和附件内容可能遗漏。
 
-Icons are generated from `icons/icon.svg`:
+默认被动观察时，复数消息页始终按局部统计，即使 `page_info.has_previous_page` 为 false，也不据此声称覆盖完整 active branch。每次新页替换当前页统计；**不将不同页直接相加，也不因重复响应重复累计**。被动模式不跨页合并、不主动补历史；手动扫描的去重和完整度规则见上节。网页下一次自然载入有效响应后再更新读数。
 
-```bash
-for s in 16 48 128; do rsvg-convert -w $s -h $s icons/icon.svg -o icons/icon$s.png; done
-```
+面板显示读取诊断，区分未捕获请求、等待响应、局部历史、结构不支持和响应无法读取。局部读数没有触发提醒，不代表整段对话很短，也无法据此推算剩余容量。
 
-### Styling
+字符按 Unicode 码点计数；用户消息数不等于“完整问答轮数”。token 为逐消息、多语言启发式估算：ASCII 字符 / 4、CJK 字符 × 1.5、其他非 ASCII 码点 × 2，向上取整。它不是 tokenizer，不计未返回的系统提示、内部推理、图片/音频编码或服务端处理后的真实上下文。返回的思考摘要也不等于全部 reasoning token。
 
-`styles.css` is hand-written and needs no build step. It is scoped entirely to the two injected roots and inherits ChatGPT's own CSS custom properties (`--text-primary`, `--main-surface-primary`, `--border-light`, …), so the widget follows the site's theme and typeface with no JavaScript. Each `var()` carries a fallback in case OpenAI renames a token.
+## 网站限制信号
 
-### Test fixtures
+被动观察已有同源 `fetch`：单数/复数 conversation 详情及复数 `/messages` 的 GET、init JSON、发送 JSON/SSE，包括已知 `conversation_detail_metadata` 包装。
 
-`test/fixtures/conversation-sample.json` is a **scrubbed** capture. The graph structure, content types, and message sizes are real; all free text, URLs, and account fields are synthetic.
+| 观测 | 显示语义 |
+| --- | --- |
+| `conversation_too_large` | 网站返回会话容量限制 |
+| `context-truncation-block` | 网站返回上下文截断限制提示 |
+| `work_usage_limit_exceeded` / `model_cap_exceeded` | 使用额度，不等于会话容量 |
+| `input_too_large` | 本次输入/上下文过长，不能认定永久终止 |
+| `is_read_only` | 只读，原因未知 |
 
-**Never commit a raw capture from your own account.** A ChatGPT conversation response embeds your email address, user ID, avatar URL, and the full text of the conversation. `.gitignore` blocks the common filenames, but the safe habit is to scrub before the file ever enters the working tree.
+显示的是**收到过的状态**，不保证仍然有效；没有观测到也不等于有剩余空间。本版不观察 WebSocket，不覆盖所有传输路径。Request 对象携带但无法直接读取的请求体不会被克隆；缺少可靠会话关联时宁可不显示信号。网站协议、实验和 DOM 变化都可能影响观察。
 
-## Caveats
+## 权限与隐私
 
-- Token counts are **estimates**. BPE estimation without the real tokenizer lands close but not exact.
-- The extension depends on ChatGPT's internal response shape, which OpenAI can change without notice. If the badge stops updating, that is the likely cause.
-- Context limits are inferred from the model slug and may lag behind new model releases.
+唯一 API 权限 `storage`，只保存提醒设置；内容脚本匹配仅限 ChatGPT。无 `tabs`、`cookies`、`webRequest`、`scripting`、额外 `host_permissions`。无遥测、上传、远程脚本、运行时 npm 依赖。见 [PRIVACY.md](PRIVACY.md)。
 
-## License
+MAIN 世界与页面共享环境，消息桥不是可信安全边界；UI只接受固定枚举与有界数字，页面仍可能伪造读数。扩展不会因桥消息启动扫描、写入聊天内容或运行代码；桥消息可导致当前扫描保守失效。
 
-MIT — see [LICENSE](LICENSE).
+## 2.0.2 分页接口修复
+
+修复了只匹配单数路径、只解析 mapping、UI 固定标记完整快照这三个问题。支持用户实测复数 URL 与当前官方前端的消息页结构；旧版接口仍兼容。增加本页统计和固定诊断文本，权限与持久存储范围不变。官方公开脚本证据及局限见 [分页证据](docs/PAGINATION_EVIDENCE.md)。
+
+## 2.0.1 启动修复
+
+用户在真实 Chrome 中遇到 `content.js:5` 读取 `settings` 时共享对象为 undefined。现在每个入口脚本内嵌自己的核心工厂，不再依赖前一个脚本设置全局变量。具体原始缺失原因未由截图单独确认。
+
+## 开发与验证
+
+- `npm run build`：将 core.js 和 src/ 中的入口合并为两个自包含浏览器脚本；无需构建依赖。修改源码后运行它，不直接编辑生成的 content.js/page_script.js。
+- `npm test`：Node 内置测试运行器，无需安装依赖。
+- `npm run package`：Python 标准库生成只包含运行文件和说明的 ZIP，不包含 fixtures、测试、git 历史。
+- `npm run test:scan-dom`：可选 jsdom 手动扫描 UI 回归；生产包不包含 jsdom。
+- `npm run test:browser`：可选 Chromium 回归，需要开发环境安装 Playwright 和浏览器；生产包不包含它们。
+- [实施检查点](docs/IMPLEMENTATION_STATUS.md)、[测试与边界](docs/VALIDATION.md)。
+
+调查及更新日期 2026-10-20。下一步由用户验收真实登录、分页与分支行为，再观察自然触顶样本，以最小元数据分别校准 Chat/Work；本版尚未加入持久统计采集，不故意刷消息触顶。
+
+原项目版权和 MIT 许可保留在 [LICENSE](LICENSE)。
