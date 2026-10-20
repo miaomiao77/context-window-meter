@@ -128,7 +128,7 @@
     if (info?.type === 'send') {
       generation++; context.generation = generation;
       const cid = C.id(body?.conversation_id);
-      if ((cid && cid === C.route(location.pathname)) || (!cid && context.newChat && body)) {
+      if ((cid && cid === C.route(location.pathname)) || (!cid && (C.route(location.pathname) || (context.newChat && body)))) {
         publish({ type: 'stale', conversationId: cid, pathname: location.pathname,
           mode: C.mode(body?.conversation_origin), observedAt: Date.now() });
       }

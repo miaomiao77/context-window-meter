@@ -196,11 +196,217 @@ function createCWMCore() {
 
 
 const C = Object.freeze(createCWMCore());
+/* Manual history scanner. Embedded ONLY in the isolated-world content entry. */
+function createCWMScanner(C, env) {
+  'use strict';
+  env = env || {};
+  const fetcher = env.fetch || ((...args) => fetch(...args));
+  const digest = env.digest || (async value => {
+    const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+    return Array.from(new Uint8Array(bytes), n => n.toString(16).padStart(2, '0')).join('');
+  });
+  const limits = { pages: 500, messages: 100000, bytes: 64 * 1024 * 1024,
+    pageBytes: 24 * 1024 * 1024, duration: 300000, requestTime: 30000, interval: 350, ...env.limits };
+  const fail = code => { throw new Error(code); };
+  const codes = new Set(['cancelled', 'changed', 'auth', 'forbidden', 'rate-limit', 'http', 'network',
+    'timeout', 'budget', 'schema', 'cursor', 'conflict', 'scope', 'work']);
+  function pause(ms, signal) {
+    return new Promise((resolve, reject) => {
+      const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(new Error('cancelled')); };
+      const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, ms);
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    });
+  }
+  async function scan({ conversationId, branch = null, signal, isCurrent = () => true, onUpdate = () => {} }) {
+    if (!C.id(conversationId) || (branch != null && !C.id(branch))) return { status: 'stopped', reason: 'scope' };
+    const controller = new AbortController(), started = Date.now();
+    const abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    let token = null, totalBytes = 0, pages = 0, format = null, leaf = null, mode = 'unknown';
+    let entries = new Map(), order = [], firstSignature = null, exhausted = false, result = null;
+    const cursors = new Set();
+    function guard() {
+      if (controller.signal.aborted) fail('cancelled');
+      if (!isCurrent()) fail('changed');
+      if (Date.now() - started > limits.duration) fail('budget');
+    }
+    function currentStats(verified = false) {
+      let nodes = order.map(id => entries.get(id));
+      if (format === 'mapping') {
+        nodes = []; const seen = new Set(); let id = leaf;
+        while (id && entries.has(id)) {
+          if (seen.has(id)) fail('conflict'); seen.add(id);
+          const e = entries.get(id); if (e.stats) nodes.push(e); id = e.parent;
+        }
+      }
+      return { ...C.aggregate(nodes.map(e => e.stats)), activeIds: nodes.filter(e => e.stats).map(e => e.id),
+        branch: leaf, mode, source: 'scan', coverage: verified ? 'branch' : 'scanned-pages',
+        complete: verified, exhausted, pages };
+    }
+    function report(status, reason = null, verified = false) {
+      const value = { status, reason, pages, exhausted, stats: currentStats(verified), mode };
+      onUpdate(value); return value;
+    }
+    async function json(path, session = false) {
+      guard();
+      // Paths are built here; neither page messages nor response next URLs can choose a target.
+      const url = new URL(path, 'https://chatgpt.com');
+      if (url.origin !== 'https://chatgpt.com') fail('scope');
+      const request = new AbortController();
+      const cancel = () => request.abort(); controller.signal.addEventListener('abort', cancel, { once: true });
+      let timedOut = false, reader;
+      const timeout = setTimeout(() => { timedOut = true; request.abort(); }, limits.requestTime);
+      try {
+        const response = await fetcher(url.href, { method: 'GET', credentials: 'same-origin', mode: 'same-origin',
+          redirect: 'error', cache: 'no-store', signal: request.signal,
+          headers: session ? { Accept: 'application/json' } : { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+        guard();
+        if (response.url && response.url !== url.href) fail('scope');
+        if (response.status === 401) fail('auth');
+        if (response.status === 403) fail('forbidden');
+        if (response.status === 429) fail('rate-limit');
+        if (!response.ok) fail('http');
+        if (!(response.headers.get('content-type') || '').includes('application/json')) fail('schema');
+        reader = response.body?.getReader(); if (!reader) fail('schema');
+        let raw = '', count = 0; const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read(); guard(); if (done) break;
+          count += value.byteLength; totalBytes += value.byteLength;
+          if (count > (session ? 1024 * 1024 : limits.pageBytes) || totalBytes > limits.bytes) fail('budget');
+          raw += decoder.decode(value, { stream: true });
+        }
+        raw += decoder.decode();
+        try { const parsed = JSON.parse(raw); raw = ''; return parsed; } catch { fail('schema'); }
+      } catch (e) {
+        if (timedOut) fail('timeout');
+        if (controller.signal.aborted) fail('cancelled');
+        if (codes.has(e.message)) throw e;
+        fail('network');
+      } finally {
+        clearTimeout(timeout); controller.signal.removeEventListener('abort', cancel);
+        if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+      }
+    }
+    async function parse(data, first) {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) fail('schema');
+      if (data.conversation_id != null && data.conversation_id !== conversationId) fail('scope');
+      const detected = C.mode(data.conversation_origin);
+      if (detected === 'work') { mode = 'work'; fail('work'); }
+      if (detected === 'chat') mode = detected;
+      const current = C.id(data.current_node);
+      if (first && !current) fail('schema');
+      if (first && branch && current !== branch) fail('changed');
+      if (!first && current && current !== leaf) fail('changed');
+      const kind = Array.isArray(data.messages) ? 'messages' : data.mapping && typeof data.mapping === 'object' && !Array.isArray(data.mapping) ? 'mapping' : null;
+      if (!kind || (format && kind !== format)) fail('schema');
+      const items = [], seen = new Set();
+      const add = async (id, message, parent) => {
+        if (!C.id(id) || seen.has(id)) fail('schema'); seen.add(id);
+        if (message && (message.id !== id || typeof message.author?.role !== 'string' ||
+          !message.content || typeof message.content !== 'object' || Array.isArray(message.content))) fail('schema');
+        const stats = message ? C.messageStats(message) : null;
+        const signature = await digest(JSON.stringify([stats, parent, message ? C.text(message.content) : null]));
+        guard(); items.push({ id, parent, stats, signature });
+      };
+      if (kind === 'messages') {
+        if (data.messages.length > limits.messages) fail('budget');
+        for (const m of data.messages) { if (!m) fail('schema'); await add(m.id, m, undefined); }
+      } else {
+        if (Object.keys(data.mapping).length > limits.messages) fail('budget');
+        for (const [id, node] of Object.entries(data.mapping)) {
+          if (!node || !Object.hasOwn(node, 'parent') || !(node.parent === null || node.parent === '' || C.id(node.parent))) fail('schema');
+          await add(id, node.message || null, node.parent);
+        }
+      }
+      let more = data.page_info?.has_previous_page, cursor = data.page_info?.start_cursor;
+      if (typeof more !== 'boolean') {
+        if (kind !== 'mapping') fail('schema');
+        more = false; // Only explicit root/parent validation can make this mapping complete.
+      }
+      if (more && (typeof cursor !== 'string' || cursor.length < 1 || cursor.length > 4096)) fail('cursor');
+      return { kind, current, items, more, cursor: more ? cursor : null };
+    }
+    function signature(page) { return JSON.stringify([page.kind, page.current, page.more,
+      page.kind === 'mapping' ? page.items.map(e => [e.id, e.signature]).sort((a,b) => a[0].localeCompare(b[0])) : page.items.map(e => [e.id, e.signature])]); }
+    function merge(page, first) {
+      if (first) { format = page.kind; leaf = page.current; }
+      const next = page.items.filter(e => !entries.has(e.id));
+      for (const e of page.items) if (entries.has(e.id) && entries.get(e.id).signature !== e.signature) fail('conflict');
+      if (!first && !next.length && page.items.length) fail('cursor');
+      if (entries.size + next.length > limits.messages) fail('budget');
+      if (format === 'messages' && !first) {
+        // Older page can overlap only as a suffix matching the oldest known prefix.
+        const overlap = page.items.filter(e => entries.has(e.id)).map(e => e.id);
+        const suffix = page.items.slice(page.items.length - overlap.length).map(e => e.id);
+        if (overlap.length && (JSON.stringify(overlap) !== JSON.stringify(suffix) ||
+          JSON.stringify(overlap) !== JSON.stringify(order.slice(0, overlap.length)))) fail('conflict');
+      }
+      for (const e of next) entries.set(e.id, e);
+      order = [...next.map(e => e.id), ...order];
+    }
+    function verifiedBranch() {
+      if (!exhausted || format !== 'mapping' || !leaf) return false;
+      const seen = new Set(); let id = leaf;
+      while (id) {
+        if (seen.has(id) || !entries.has(id)) return false; seen.add(id);
+        id = entries.get(id).parent;
+      }
+      return true;
+    }
+    const initial = new URL('/backend-api/conversations/' + conversationId, 'https://chatgpt.com');
+    initial.searchParams.set('num_turns', '10'); initial.searchParams.set('include_has_versions', 'true');
+    if (branch) initial.searchParams.set('include_message_id', branch);
+    try {
+      guard(); report('auth');
+      let session = await json('/api/auth/session', true);
+      if (typeof session?.accessToken !== 'string' || !/^[\x21-\x7E]{1,32768}$/.test(session.accessToken)) fail('auth');
+      token = session.accessToken; session = null;
+      let url = initial.href;
+      while (true) {
+        guard(); if (pages >= limits.pages) fail('budget');
+        let data = await json(url), page = await parse(data, pages === 0); data = null;
+        const first = pages === 0;
+        merge(page, first); pages++;
+        if (first) firstSignature = signature(page);
+        exhausted = !page.more; report('reading');
+        if (exhausted) break;
+        if (cursors.has(page.cursor)) fail('cursor'); cursors.add(page.cursor);
+        const next = new URL('/backend-api/conversations/' + conversationId + '/messages', 'https://chatgpt.com');
+        next.searchParams.set('before', page.cursor); next.searchParams.set('num_turns', '10');
+        next.searchParams.set('include_has_versions', 'true'); url = next.href; page = null;
+        await pause(limits.interval, controller.signal);
+      }
+      report('verifying'); await pause(limits.interval, controller.signal);
+      let check = await json(initial.href), page = await parse(check, true); check = null;
+      if (signature(page) !== firstSignature) fail('changed');
+      guard();
+      result = report('done', null, verifiedBranch());
+    } catch (e) {
+      // Never echo server errors, URLs, bodies, IDs or auth values into UI/logs.
+      const reason = codes.has(e.message) ? e.message : 'network';
+      if (reason === 'changed' || reason === 'conflict' || reason === 'scope') {
+        entries.clear(); order = []; exhausted = false;
+      }
+      try { result = report('stopped', reason); }
+      catch { result = { status: 'stopped', reason: 'conflict', pages, exhausted: false, stats: null }; onUpdate(result); }
+    } finally {
+      token = null; entries.clear(); order = []; cursors.clear(); firstSignature = null;
+      signal?.removeEventListener('abort', abort); controller.abort();
+    }
+    return result;
+  }
+  return { scan };
+}
+
 /* Isolated-world UI. Only validated aggregate observations enter this world. */
 (function () {
   'use strict';
   let config = C.settings(), pathname = location.pathname, detected = 'unknown';
   let historyRead = null;
+  let manual = null, manualStats = null, manualController = null, manualRun = 0;
+  const manualScanner = createCWMScanner(C);
   let network = null, signal = null, stats = null, root, badge, panel, notice, observer;
   let highestStage = 0, dismissed = 0, snoozeUntil = 0, ignored = false, scanTimer, open = false;
   let lastObservation = 0, routeChangedAt = 0, storageFailed = false;
@@ -214,8 +420,33 @@ const C = Object.freeze(createCWMCore());
     input: '本次输入或请求上下文过长；尚不能判断对话已永久终止。',
     readonly: '网站将此对话标为只读；原因未确认。'
   };
+  function invalidateManual(reason = 'changed') {
+    if (!manual && !manualController) return;
+    manualRun++; manualController?.abort(); manualController = null; manualStats = null;
+    manual = { status: 'stopped', reason, pages: manual?.pages || 0 };
+  }
+  async function startManual(event) {
+    // MAIN messages and synthetic DOM events cannot trigger authenticated requests.
+    if (!event.isTrusted || manualController) return;
+    resetRoute(); const cid = C.route(location.pathname);
+    if (!cid || C.effectiveMode(detected, config.mode) === 'work') return;
+    const scanPath = location.pathname, run = ++manualRun;
+    const branch = C.id(network?.branch);
+    manualStats = null; manual = { status: 'auth', pages: 0 };
+    const controller = new AbortController(); manualController = controller; render();
+    await manualScanner.scan({ conversationId: cid, branch, signal: controller.signal,
+      isCurrent: () => run === manualRun && location.pathname === scanPath,
+      onUpdate: value => {
+        if (run !== manualRun || location.pathname !== scanPath) return;
+        manual = value; manualStats = value.stats?.messages ? value.stats : null;
+        if (value.mode === 'work' || value.mode === 'chat') detected = value.mode;
+        stats = manualStats || network; render();
+      } });
+    if (run === manualRun) { manualController = null; scheduleScan(); render(); }
+  }
   function resetRoute() {
     if (pathname === location.pathname) return false;
+    invalidateManual(); manual = null;
     retiredIds = new Set(visibleIds); visibleIds.clear();
     pathname = location.pathname; detected = 'unknown'; network = null; signal = null; stats = null; historyRead = null;
     highestStage = 0; dismissed = 0; snoozeUntil = 0; ignored = false; lastObservation = 0; routeChangedAt = Date.now();
@@ -264,8 +495,12 @@ const C = Object.freeze(createCWMCore());
       historyRead = { family: p.history.family, page: p.history.page === true, status: p.history.status,
         requestedTurns: Number.isSafeInteger(p.history.requestedTurns) && p.history.requestedTurns >= 0 && p.history.requestedTurns <= 100000 ? p.history.requestedTurns : null };
     }
-    if (p.type === 'snapshot') network = validStats(p.stats);
-    if (p.type === 'stale') network = null;
+    if (p.type === 'snapshot') {
+      const next = validStats(p.stats);
+      if (manualStats?.branch && next?.branch && next.branch !== manualStats.branch) invalidateManual();
+      network = next;
+    }
+    if (p.type === 'stale') { network = null; invalidateManual(); }
     scheduleScan();
   });
   function scan() {
@@ -285,14 +520,15 @@ const C = Object.freeze(createCWMCore());
         content: { parts: [el.innerText || ''] } }));
     }
     // Old messages may linger during client-side navigation; never relabel them as the new chat.
-    if (retiredIds.size && [...ids].some(id => retiredIds.has(id))) { stats = network; render(); return; }
+    if (retiredIds.size && [...ids].some(id => retiredIds.has(id))) { stats = manualStats || network; render(); return; }
     retiredIds.clear(); visibleIds = ids;
     const visible = values.length ? { ...C.aggregate(values), source: 'dom', complete: false } : null;
     // A changed branch/new stream invalidates a previously loaded active branch.
     if (network && ids.size && [...ids].some(id => !network.activeIds.includes(id))) network = null;
     // Never silently pin old history when streaming mutates an existing message ID.
     if (network && visible && (visible.chars > network.chars || visible.turns > network.turns)) network = null;
-    stats = network || visible;
+    if (manualStats?.complete && ids.size && [...ids].some(id => !manualStats.activeIds.includes(id))) invalidateManual();
+    stats = manualStats || network || visible;
     render();
   }
   function scheduleScan(delay = 300) {
@@ -311,10 +547,12 @@ const C = Object.freeze(createCWMCore());
     const title = strong ? '网站限制' : remind ? (stage === 2 ? '建议准备接续' : '接续提醒') : '接续';
     badge.textContent = `${title} · ${stats ? format(stats.turns) + ' 条' : '待观察'}`;
     root.dataset.level = strong ? 'stop' : remind ? 'remind' : 'quiet';
-    byId('state').textContent = stats ? (stats.source === 'history' ? (stats.complete ? '已读取当前分支快照' : stats.coverage === 'message-page' ? '本页消息统计 · 非完整对话' : '当前分支片段 · 非完整对话') : '当前页面可见内容 · 可能少算') : '尚未取得可测量内容';
-    byId('counts').textContent = stats ? `${stats.source === 'history' && !stats.complete ? (stats.coverage === 'message-page' ? '本页 ' : '片段中 ') : ''}${format(stats.turns)} 条用户消息 · ${format(stats.chars)} 个字符` : '打开已有对话，或正常发送消息后观察。';
+    byId('state').textContent = stats?.source === 'scan' ? (stats.complete ? '扫描完成 · 已核对返回分支父链' : manual?.status === 'done' ? '接口历史已读完 · 分支关系未验证' : '扫描已读取部分历史 · 尚不完整') : stats ? (stats.source === 'history' ? (stats.complete ? '已读取当前分支快照' : stats.coverage === 'message-page' ? '本页消息统计 · 非完整对话' : '当前分支片段 · 非完整对话') : '当前页面可见内容 · 可能少算') : '尚未取得可测量内容';
+    byId('counts').textContent = stats ? `${(stats.source === 'history' || stats.source === 'scan') && !stats.complete ? (stats.coverage === 'message-page' ? '本页 ' : '片段中 ') : ''}${format(stats.turns)} 条用户消息 · ${format(stats.chars)} 个字符` : '打开已有对话，或正常发送消息后观察。';
     byId('estimate').textContent = stats ? `约 ${format(stats.tokens)} 个文本 token（启发式估算）` : '';
-    byId('coverage').textContent = stats?.source === 'history'
+    byId('coverage').textContent = stats?.source === 'scan'
+      ? (stats.complete ? '已沿接口提供的父链核对到根，并复查首页未变；只代表这次返回的分支历史。' : '已按消息 ID 去重。消息数组缺少可核对的父链，不能把翻到最早一页当作完整 active branch 的证明。') + ' 扫描结果是当时快照；发送、编辑或切换分支后需重新扫描。不等于模型输入或剩余容量。'
+      : stats?.source === 'history'
       ? stats.complete ? '快照包含接口提供的当前分支文本；不等于模型实际输入。未返回的系统内容、内部推理和附件编码无法计量。'
         : (stats.coverage === 'message-page' ? '仅统计本次响应 messages 中的消息，不展开其他版本，不将不同页直接相加。' : '仅统计从当前节点回溯得到的已返回片段。') +
           (stats.requestedTurns != null ? ` 本次请求 num_turns=${stats.requestedTurns}；它是分页参数，不是总对话轮数。` : '') +
@@ -325,6 +563,18 @@ const C = Object.freeze(createCWMCore());
     byId('history').textContent = historyRead
       ? `${historyRead.family === 'plural' ? '复数历史接口' : '旧版历史接口'}${historyRead.page ? ' /messages' : ''}${historyRead.requestedTurns != null ? ` · num_turns=${historyRead.requestedTurns}` : ''}：${historyLabels[historyRead.status]}。`
       : '尚未观察到支持的历史请求；网页缓存或其他传输路径可能不经过此观察器。';
+    const scanLabels = { auth: '正在取得本次扫描的登录凭据…', reading: '正在读取历史…', verifying: '已到历史起点，正在复查首页…',
+      done: manualStats?.complete ? '完成：已核对返回分支父链。' : '完成：接口历史已读完；分支关系未验证。' };
+    const stopLabels = { cancelled: '扫描已取消，保留已读部分。', changed: '对话或分支发生变化，扫描结果已作废，请重新扫描。',
+      auth: '登录凭据不可用，请在网站重新确认登录后再试。', forbidden: '网站拒绝了扫描请求（403）。', 'rate-limit': '网站限制了读取频率（429）；已停止，稍后再试。',
+      http: '历史接口返回错误，扫描已停止。', network: '网络请求未完成，扫描已停止。', timeout: '读取超时，扫描已停止。',
+      budget: '达到本次扫描的页数、字节或时间预算，当前结果不完整。', schema: '接口结构暂不支持，当前结果不完整。',
+      cursor: '分页游标未正常推进，已停止以避免重复请求。', conflict: '分页内容或顺序冲突，结果已作废。',
+      scope: '响应会话不符，结果已作废。', work: '识别为 Work，已停止扫描，不套用 Chat 规则。' };
+    byId('scan-status').textContent = manual ? (manual.status === 'stopped' ? stopLabels[manual.reason] || '扫描已停止。' : scanLabels[manual.status]) +
+      ` 已读 ${format(manual.pages)} 页${manualStats ? ' · ' + format(manualStats.messages) + ' 条消息（含双方及工具等）' : ''}` : '仅点击后扫描；按页读取，可随时取消。';
+    byId('scan-start').disabled = !!manualController || !C.route(pathname) || currentMode === 'work';
+    byId('scan-cancel').hidden = !manualController;
     byId('mode-label').textContent = currentMode === 'work' ? 'Work：不套用 Chat 提醒阈值' : currentMode === 'chat'
       ? (detected === 'chat' ? 'Chat：按来源识别' : 'Chat：手动指定；若识别出 Work 会停用提醒')
       : '模式未确认：请在设置中指定 Chat 后启用规模提醒。';
@@ -364,10 +614,11 @@ const C = Object.freeze(createCWMCore());
       <div id="cwm-panel" role="dialog" aria-label="对话规模与接续提醒" hidden>
         <header><strong>接续提醒器</strong><button id="cwm-close" type="button" aria-label="关闭面板">×</button></header>
         <p id="cwm-state"></p><p id="cwm-history" class="cwm-muted"></p><p id="cwm-counts" class="cwm-counts"></p><p id="cwm-estimate"></p>
+        <div class="cwm-buttons"><button id="cwm-scan-start" type="button">扫描当前对话</button><button id="cwm-scan-cancel" type="button" hidden>取消扫描</button></div><p id="cwm-scan-status" class="cwm-muted" role="status"></p><p class="cwm-muted">手动扫描会使用当前登录会话，向 ChatGPT 逐页读取历史；正文与临时令牌不保存。</p>
         <p id="cwm-mode-label" class="cwm-muted"></p>
         <div id="cwm-reminder-box" class="cwm-callout" hidden><p id="cwm-reminder-text"></p><div class="cwm-buttons"><button id="cwm-snooze" type="button">30 分钟后提醒</button><button id="cwm-ignore" type="button">本次查看不再提醒</button></div></div>
         <p id="cwm-server" class="cwm-callout" hidden></p><p id="cwm-observed" class="cwm-muted"></p>
-        <details><summary>统计范围与局限</summary><p id="cwm-coverage"></p><ul id="cwm-breakdown"></ul><p>没有可靠的官方剩余容量信号，不能预测必然触顶时间。可见历史、模型上下文和会话硬上限不是同一项指标。</p><p>仅观察网页已有的 fetch JSON/SSE；不观察 WebSocket，不主动请求接口。页面更新可能使观察失效。</p></details>
+        <details><summary>统计范围与局限</summary><p id="cwm-coverage"></p><ul id="cwm-breakdown"></ul><p>没有可靠的官方剩余容量信号，不能预测必然触顶时间。可见历史、模型上下文和会话硬上限不是同一项指标。</p><p>默认被动观察已有 fetch JSON/SSE；手动扫描会主动读取同源登录会话和历史。不观察 WebSocket。页面更新可能使观察失效。</p></details>
         <details><summary>提醒设置</summary><form id="cwm-settings">
           <label class="cwm-check"><input name="enabled" type="checkbox">启用规模提醒</label>
           <label>提醒模式<select name="mode"><option value="auto">自动识别（未知时不提醒）</option><option value="chat">手动指定 Chat</option><option value="work">Work（不评估容量）</option></select></label>
@@ -378,6 +629,8 @@ const C = Object.freeze(createCWMCore());
       </div>`;
     document.body.appendChild(root);
     badge = byId('badge'); panel = byId('panel'); notice = byId('notice');
+    byId('scan-start').addEventListener('click', startManual);
+    byId('scan-cancel').addEventListener('click', () => manualController?.abort());
     badge.addEventListener('click', () => setOpen(!open));
     byId('close').addEventListener('click', () => setOpen(false));
     byId('notice-open').addEventListener('click', () => setOpen(true));
@@ -387,7 +640,7 @@ const C = Object.freeze(createCWMCore());
     // Editing/regeneration/branch controls can change the active branch without a history GET.
     document.addEventListener('click', event => {
       if (!root.contains(event.target) && event.target.closest?.('article button, [data-message-id] button')) {
-        network = null; scheduleScan();
+        network = null; invalidateManual(); scheduleScan();
       }
     }, true);
     document.addEventListener('keydown', event => { if (event.key === 'Escape' && open) setOpen(false); });
@@ -424,6 +677,11 @@ const C = Object.freeze(createCWMCore());
     });
     observer = new MutationObserver(mutations => {
       if (mutations.every(m => root.contains(m.target))) return;
+      // Changes inside a rendered message can mean streaming/editing, even at equal text length.
+      if (manual && mutations.some(m => {
+        const target = m.target.nodeType === 1 ? m.target : m.target.parentElement;
+        return target?.closest('[data-message-id], [data-message-author-role]');
+      })) invalidateManual();
       scheduleScan();
     });
     observer.observe(document.body, { subtree: true, childList: true, characterData: true,
