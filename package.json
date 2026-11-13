@@ -1,6 +1,6 @@
 {
   "name": "context-window-meter",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Local conversation-size observations and configurable continuation reminders",
   "scripts": {
     "test": "python3 scripts/build.py --check && node --test test/*.test.js",
@@ -9,5 +9,9 @@
     "test:dom": "node test/dom.cjs",
     "build": "python3 scripts/build.py",
     "test:scan-dom": "node test/scan-dom.cjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "gpt-tokenizer": "4.1.2"
   }
 }

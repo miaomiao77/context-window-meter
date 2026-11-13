@@ -8,3 +8,7 @@ dist/
 sample_response.json
 sample_response.txt
 *.capture.json
+
+# Rebuild the browser entries from the locked sources.
+/content.js
+/page_script.js

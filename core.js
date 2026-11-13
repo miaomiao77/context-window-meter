@@ -33,7 +33,7 @@ function createCWMCore() {
     if (['chat', 'chatgpt'].includes(value)) return 'chat';
     return 'unknown';
   }
-  function text(content) {
+  function text(content, diagnostic) {
     if (!content || typeof content !== 'object') return '';
     const out = [];
     const add = v => { if (typeof v === 'string') out.push(v); };
@@ -42,18 +42,35 @@ function createCWMCore() {
       if (typeof part === 'string') add(part);
       else if (part && ['text', 'input_text', 'output_text'].includes(part.content_type || part.type)) add(part.text);
     }
-    for (const key of ['text', 'result', 'content', 'summary', 'model_set_context',
-      'structured_context', 'repo_summary', 'repository', 'user_instructions', 'user_profile']) add(content[key]);
+    // Keep genuine repetitions within an ordered sequence. Skip exact mirrors between
+    // alternative representations of the same payload, never between messages.
+    const mirror = () => { if (diagnostic) diagnostic.mirrors++; };
+    const partsRepresentations = new Set(out);
+    if (out.length > 1) { partsRepresentations.add(out.join('')); partsRepresentations.add(out.join('\n')); }
+    for (const key of ['text', 'result', 'content', 'summary']) {
+      const v = content[key]; if (typeof v !== 'string' || !v.length) continue;
+      if (partsRepresentations.has(v)) mirror(); else { add(v); partsRepresentations.add(v); }
+    }
+    for (const key of ['model_set_context', 'structured_context', 'repo_summary', 'repository', 'user_instructions', 'user_profile']) {
+      const v = content[key]; if (typeof v !== 'string' || !v) continue;
+      if (partsRepresentations.has(v)) mirror(); else { add(v); partsRepresentations.add(v); }
+    }
     for (const thought of Array.isArray(content.thoughts) ? content.thoughts : []) {
       if (typeof thought === 'string') add(thought);
       else if (thought) {
-        add(thought.summary); add(thought.content);
-        if (Array.isArray(thought.chunks)) for (const chunk of thought.chunks) {
-          if (typeof chunk === 'string') add(chunk); else if (chunk) add(chunk.text);
+        const chunks = (Array.isArray(thought.chunks) ? thought.chunks : [])
+          .map(c => typeof c === 'string' ? c : c?.text).filter(c => typeof c === 'string');
+        const forms = new Set([...chunks, chunks.join(''), chunks.join('\n')]);
+        for (const v of [thought.summary, thought.content]) if (typeof v === 'string' && v) {
+          if (forms.has(v)) mirror(); else { add(v); forms.add(v); }
         }
+        for (const c of chunks) add(c);
       }
     }
-    return out.join('\n');
+    return out.join('\n').replace(/\bdata:(?:[\w.+-]+\/[\w.+-]+)?(?:;[\w.+-]+=[\w.%+-]+)*;base64,[a-z0-9+/_-]+={0,2}/gi, () => {
+      if (diagnostic) diagnostic.inlineAssets++;
+      return '';
+    });
   }
   function estimateTokens(value) {
     // A multilingual heuristic, NOT a tokenizer or hidden/model-context count.
@@ -65,25 +82,30 @@ function createCWMCore() {
     }
     return Math.ceil(ascii / 4 + cjk * 1.5 + other * 2);
   }
-  function messageStats(message) {
+  function messageStats(message, counter = estimateTokens, measured) {
     const content = message?.content || {};
-    const value = text(content);
+    const diag = { mirrors: 0, inlineAssets: 0 };
+    const value = text(content, diag);
+    if (measured) measured.value = value;
     let role = ROLES.includes(message?.author?.role) ? message.author.role : 'other';
     const type = content.content_type;
     if (['thoughts', 'reasoning_recap'].includes(type)) role = 'reasoning';
     if (['model_editable_context', 'user_editable_context'].includes(type)) role = 'system';
-    return { role, chars: [...value].length, tokens: estimateTokens(value),
+    return { role, chars: [...value].length, tokens: counter(value), mirrors: diag.mirrors,
       turn: role === 'user' && !message?.metadata?.is_visually_hidden_from_conversation ? 1 : 0,
-      omitted: (Array.isArray(content.parts) ? content.parts : []).some(p => typeof p !== 'string' &&
-        !['text', 'input_text', 'output_text'].includes(p?.content_type || p?.type)) || false };
+      omitted: diag.inlineAssets > 0 || (Array.isArray(content.parts) ? content.parts : []).some(p => typeof p !== 'string' &&
+        !(['text', 'input_text', 'output_text'].includes(p?.content_type || p?.type) && typeof p.text === 'string')) ||
+        !!content.assets?.length || ['structured_context','result','content','summary'].some(k => content[k] && typeof content[k] === 'object') ||
+        (!value && !!type && !['text','thoughts','reasoning_recap','user_editable_context','model_editable_context'].includes(type)) };
   }
   function aggregate(nodes) {
     const result = { chars: 0, tokens: 0, turns: 0, messages: 0, omitted: false,
-      breakdown: Object.fromEntries(ROLES.map(role => [role, 0])) };
+      mirrors: 0, omittedMessages: 0, breakdown: Object.fromEntries(ROLES.map(role => [role, 0])) };
     for (const node of nodes) {
       if (!node) continue;
       result.chars += node.chars; result.tokens += node.tokens; result.turns += node.turn;
       result.messages++; result.omitted ||= node.omitted;
+      result.mirrors += node.mirrors || 0; result.omittedMessages += node.omitted ? 1 : 0;
       result.breakdown[node.role] += node.tokens;
     }
     return result;

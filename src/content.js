@@ -4,7 +4,7 @@
   let config = C.settings(), pathname = location.pathname, detected = 'unknown';
   let historyRead = null;
   let manual = null, manualStats = null, manualController = null, manualRun = 0;
-  const manualScanner = createCWMScanner(C);
+  const manualScanner = createCWMScanner(C, { countTokens: countLocalTokens });
   let network = null, signal = null, stats = null, root, badge, panel, notice, observer;
   let highestStage = 0, dismissed = 0, snoozeUntil = 0, ignored = false, scanTimer, open = false;
   let lastObservation = 0, routeChangedAt = 0, storageFailed = false;
@@ -19,6 +19,7 @@
     readonly: '网站将此对话标为只读；原因未确认。'
   };
   function invalidateManual(reason = 'changed') {
+    manualScanner.discard();
     if (!manual && !manualController) return;
     manualRun++; manualController?.abort(); manualController = null; manualStats = null;
     manual = { status: 'stopped', reason, pages: manual?.pages || 0 };
@@ -30,9 +31,10 @@
     if (!cid || C.effectiveMode(detected, config.mode) === 'work') return;
     const scanPath = location.pathname, run = ++manualRun;
     const branch = C.id(network?.branch);
+    const resume = manual?.resumable === true;
     manualStats = null; manual = { status: 'auth', pages: 0 };
     const controller = new AbortController(); manualController = controller; render();
-    await manualScanner.scan({ conversationId: cid, branch, signal: controller.signal,
+    await manualScanner.scan({ conversationId: cid, branch, resume, signal: controller.signal,
       isCurrent: () => run === manualRun && location.pathname === scanPath,
       onUpdate: value => {
         if (run !== manualRun || location.pathname !== scanPath) return;
@@ -126,7 +128,7 @@
     if (network && ids.size && [...ids].some(id => !network.activeIds.includes(id))) network = null;
     // Never silently pin old history when streaming mutates an existing message ID.
     if (network && visible && (visible.chars > network.chars || visible.turns > network.turns)) network = null;
-    if (manualStats?.complete && ids.size && [...ids].some(id => !manualStats.activeIds.includes(id))) invalidateManual();
+    if (manual?.scanState === 'complete' && manualStats && ids.size && [...ids].some(id => !manualStats.activeIds.includes(id))) invalidateManual();
     stats = manualStats || network || visible;
     render();
   }
@@ -148,7 +150,10 @@
     root.dataset.level = strong ? 'stop' : remind ? 'remind' : 'quiet';
     byId('state').textContent = stats?.source === 'scan' ? (stats.complete ? '扫描完成 · 已核对返回分支父链' : manual?.status === 'done' ? '接口历史已读完 · 分支关系未验证' : '扫描已读取部分历史 · 尚不完整') : stats ? (stats.source === 'history' ? (stats.complete ? '已读取当前分支快照' : stats.coverage === 'message-page' ? '本页消息统计 · 非完整对话' : '当前分支片段 · 非完整对话') : '当前页面可见内容 · 可能少算') : '尚未取得可测量内容';
     byId('counts').textContent = stats ? `${stats.source === 'scan' ? '扫描已读 ' : stats.source === 'history' && !stats.complete ? (stats.coverage === 'message-page' ? '本页 ' : '片段中 ') : ''}${format(stats.turns)} 条用户消息 · ${format(stats.chars)} 个字符` : '打开已有对话，或正常发送消息后观察。';
-    byId('estimate').textContent = stats ? `约 ${format(stats.tokens)} 个文本 token（启发式估算）` : '';
+    const exact = stats?.source === 'scan';
+    byId('estimate').textContent = stats ? (exact
+      ? `${manual?.status === 'done' ? '已读历史' : '部分小计'}：${format(stats.tokens)} 个文本 token（o200k_base）${manual?.scanState === 'complete' ? '' : manual?.historyStartReached ? ' · 已到接口历史起点，尚未通过核对' : ' · 尚未确认到达历史起点'}`
+      : `约 ${format(stats.tokens)} 个文本 token（快速估算；手动扫描可本地分词）`) : '';
     byId('coverage').textContent = stats?.source === 'scan'
       ? (stats.complete ? '已沿接口提供的父链核对到根，并复查首页未变；只代表这次返回的分支历史。' : '已按消息 ID 去重。消息数组缺少可核对的父链，不能把翻到最早一页当作完整 active branch 的证明。') + ' 扫描结果是当时快照；发送、编辑或切换分支后需重新扫描。不等于模型输入或剩余容量。'
       : stats?.source === 'history'
@@ -167,12 +172,16 @@
     const stopLabels = { cancelled: '扫描已取消，保留已读部分。', changed: '对话或分支发生变化，扫描结果已作废，请重新扫描。',
       auth: '登录凭据不可用，请在网站重新确认登录后再试。', forbidden: '网站拒绝了扫描请求（403）。', 'rate-limit': '网站限制了读取频率（429）；已停止，稍后再试。',
       http: '历史接口返回错误，扫描已停止。', network: '网络请求未完成，扫描已停止。', timeout: '读取超时，扫描已停止。',
-      budget: '达到本次扫描的页数、字节或时间预算，当前结果不完整。', schema: '接口结构暂不支持，当前结果不完整。',
+      budget: '达到本次扫描预算：' + ({duration:'时长',pages:'分页数',bytes:'总响应字节',messages:'消息数',pageBytes:'单个响应字节'}[manual?.budgetType] || '资源') + '。', schema: '接口结构暂不支持，当前结果不完整。',
       cursor: '分页游标未正常推进，已停止以避免重复请求。', conflict: '分页内容或顺序冲突，结果已作废。',
+      'missing-parent': '接口已无更早页，但当前分支缺少父节点，无法确认历史起点。',
+      'missing-leaf': '接口已无更早页，但消息序列末端与当前节点不符。',
+      'newer-pages': '首页标记仍有更新消息，未覆盖对话末端。',
       scope: '响应会话不符，结果已作废。', work: '识别为 Work，已停止扫描，不套用 Chat 规则。' };
     byId('scan-status').textContent = manual ? (manual.status === 'stopped' ? stopLabels[manual.reason] || '扫描已停止。' : scanLabels[manual.status]) +
       ` 已读 ${format(manual.pages)} 页${manualStats ? ' · ' + format(manualStats.messages) + ' 条消息（含双方及工具等）' : ''}` : '仅点击后扫描；按页读取，可随时取消。';
     byId('scan-start').disabled = !!manualController || !C.route(pathname) || currentMode === 'work';
+    byId('scan-start').textContent = manual?.resumable ? '从断点继续扫描' : '扫描当前对话';
     byId('scan-cancel').hidden = !manualController;
     byId('mode-label').textContent = currentMode === 'work' ? 'Work：不套用 Chat 提醒阈值' : currentMode === 'chat'
       ? (detected === 'chat' ? 'Chat：按来源识别' : 'Chat：手动指定；若识别出 Work 会停用提醒')
@@ -190,9 +199,31 @@
     if (stats) for (const role of C.ROLES) {
       if (!stats.breakdown[role]) continue;
       const item = document.createElement('li');
-      item.textContent = `${labels[role]}：约 ${format(stats.breakdown[role])} token`;
+      item.textContent = `${labels[role]}：${exact ? '' : '约 '}${format(stats.breakdown[role])} token`;
       byId('breakdown').appendChild(item);
     }
+    byId('scan-details').hidden = !exact;
+    if (!exact) byId('diagnostics').textContent = '';
+    else if (byId('scan-details').open) renderDiagnostics();
+    if (exact) {
+      const item = document.createElement('li');
+      item.textContent = `已跳过 ${format(stats.mirrors)} 个镜像文本字段；${format(stats.omittedMessages)} 条消息含未计量的非文本或不支持的内容。`;
+      byId('breakdown').appendChild(item);
+    }
+  }
+  function renderDiagnostics() {
+    const d = manualStats?.diagnostics;
+    if (!d) return;
+    const counts = obj => Object.entries(obj).map(([key,n]) => key+' '+format(n)).join('，');
+    byId('diagnostics').textContent = [
+      d.format+' · 起点'+(manual.historyStartReached ? '已到达' : '未确认')+' · 首页复查'+(manual.headVerified ? '通过' : '未通过或尚未执行'),
+      '原始条目 '+d.rawItems+' · 唯一消息 ID '+d.uniqueMessages+' · 重复 ID 次数 '+d.duplicateIds,
+      '已计量作者 '+counts(d.roleCounts), '类型 '+counts(d.contentTypes),
+      '其中隐藏 '+d.hiddenMessages+' 条，共 '+format(d.hiddenTokens)+' token',
+      '最大单条（token / 页 / 作者 / 类型）', ...d.largest.map(m=>[m.tokens,m.page,m.role,m.type].join(' / ')),
+      '页 / 原始条目 / 页内重复 / 跨页重叠 / 计量消息 / 计入 token',
+      ...d.pageRows.map((r,i)=>[i+1,r.raw,r.within,r.overlap,r.counted,r.tokens].join(' / '))
+    ].join('\n');
   }
   function setOpen(value) {
     open = value; panel.hidden = !value; badge.setAttribute('aria-expanded', String(value));
@@ -218,6 +249,7 @@
         <div id="cwm-reminder-box" class="cwm-callout" hidden><p id="cwm-reminder-text"></p><div class="cwm-buttons"><button id="cwm-snooze" type="button">30 分钟后提醒</button><button id="cwm-ignore" type="button">本次查看不再提醒</button></div></div>
         <p id="cwm-server" class="cwm-callout" hidden></p><p id="cwm-observed" class="cwm-muted"></p>
         <details><summary>统计范围与局限</summary><p id="cwm-coverage"></p><ul id="cwm-breakdown"></ul><p>没有可靠的官方剩余容量信号，不能预测必然触顶时间。可见历史、模型上下文和会话硬上限不是同一项指标。</p><p>默认被动观察已有 fetch JSON/SSE；手动扫描会主动读取同源登录会话和历史。不观察 WebSocket。页面更新可能使观察失效。</p></details>
+        <details id="cwm-scan-details" hidden><summary>扫描诊断（无正文）</summary><pre id="cwm-diagnostics"></pre></details>
         <details><summary>提醒设置</summary><form id="cwm-settings">
           <label class="cwm-check"><input name="enabled" type="checkbox">启用规模提醒</label>
           <label>提醒模式<select name="mode"><option value="auto">自动识别（未知时不提醒）</option><option value="chat">手动指定 Chat</option><option value="work">Work（不评估容量）</option></select></label>
@@ -228,6 +260,7 @@
       </div>`;
     document.body.appendChild(root);
     badge = byId('badge'); panel = byId('panel'); notice = byId('notice');
+    byId('scan-details').addEventListener('toggle', () => { if (byId('scan-details').open) renderDiagnostics(); });
     byId('scan-start').addEventListener('click', startManual);
     byId('scan-cancel').addEventListener('click', () => manualController?.abort());
     badge.addEventListener('click', () => setOpen(!open));

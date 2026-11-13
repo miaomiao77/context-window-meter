@@ -1,12 +1,12 @@
 # Context Window Meter · 接续提醒器
 
-个人维护的 ChatGPT 浏览器扩展 fork，基于原 Context Window Meter 改造。当前版本 **2.1.0**，非 OpenAI 官方产品。
+个人维护的 ChatGPT 浏览器扩展 fork，当前版本 **2.2.0**，非 OpenAI 官方产品。手动扫描已改用离线 o200k_base 分词、支持断点续扫。用于画经验线时，只对比同版本的完成读数。见[分词口径与验收](docs/MEASUREMENT.md)。
 
 目标是在长对话中提醒你提前整理接续信息。**没有可靠的官方剩余容量信号，不能保证在触顶前提醒。** 本扩展不再显示“已占用模型窗口百分比”“剩余 token”或预计剩余轮数。
 
 ## 使用
 
-见 [INSTALL.md](INSTALL.md)。解压发布包，用桌面 Chromium 浏览器的“加载已解压的扩展程序”安装。只在 `https://chatgpt.com/*` 工作。
+见 [INSTALL.md](INSTALL.md)。此修复分支提供源码。先在根目录运行 `npm ci --ignore-scripts`、`npm run build`，再用桌面 Chromium 加载仓库目录。只在 `https://chatgpt.com/*` 工作。
 
 页面右下角出现“接续”按钮，点击展开。首次使用建议进入提醒设置：
 
@@ -48,7 +48,7 @@
 
 面板显示读取诊断，区分未捕获请求、等待响应、局部历史、结构不支持和响应无法读取。局部读数没有触发提醒，不代表整段对话很短，也无法据此推算剩余容量。
 
-字符按 Unicode 码点计数；用户消息数不等于“完整问答轮数”。token 为逐消息、多语言启发式估算：ASCII 字符 / 4、CJK 字符 × 1.5、其他非 ASCII 码点 × 2，向上取整。它不是 tokenizer，不计未返回的系统提示、内部推理、图片/音频编码或服务端处理后的真实上下文。返回的思考摘要也不等于全部 reasoning token。
+字符按 Unicode 码点计数；用户消息数不等于“完整问答轮数”。只有被动观察仍按字符粗估。手动扫描用包内词表逐消息计数，不计未返回的系统提示、内部推理、图片/音频编码或服务端处理后的真实上下文。
 
 ## 网站限制信号
 
@@ -80,8 +80,8 @@ MAIN 世界与页面共享环境，消息桥不是可信安全边界；UI只接�
 
 ## 开发与验证
 
-- `npm run build`：将 core.js 和 src/ 中的入口合并为两个自包含浏览器脚本；无需构建依赖。修改源码后运行它，不直接编辑生成的 content.js/page_script.js。
-- `npm test`：Node 内置测试运行器，无需安装依赖。
+- 先 `npm ci --ignore-scripts`，再 `npm run build`。锁定的构建依赖将本地词表编入隔离脚本。用户安装成品无需 npm。
+- `npm test`：校验构建并运行 Node 回归。
 - `npm run package`：Python 标准库生成只包含运行文件和说明的 ZIP，不包含 fixtures、测试、git 历史。
 - `npm run test:scan-dom`：可选 jsdom 手动扫描 UI 回归；生产包不包含 jsdom。
 - `npm run test:browser`：可选 Chromium 回归，需要开发环境安装 Playwright 和浏览器；生产包不包含它们。

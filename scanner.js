@@ -11,7 +11,7 @@ function createCWMScanner(C, env) {
     pageBytes: 24 * 1024 * 1024, duration: 300000, requestTime: 30000, interval: 350, ...env.limits };
   const fail = code => { throw new Error(code); };
   const codes = new Set(['cancelled', 'changed', 'auth', 'forbidden', 'rate-limit', 'http', 'network',
-    'timeout', 'budget', 'schema', 'cursor', 'conflict', 'scope', 'work']);
+    'timeout', 'budget', 'schema', 'cursor', 'conflict', 'scope', 'work', 'missing-parent', 'missing-leaf', 'newer-pages']);
   function pause(ms, signal) {
     return new Promise((resolve, reject) => {
       const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(new Error('cancelled')); };
@@ -20,7 +20,9 @@ function createCWMScanner(C, env) {
       if (signal.aborted) abort();
     });
   }
-  async function scan({ conversationId, branch = null, signal, isCurrent = () => true, onUpdate = () => {} }) {
+  let checkpoint = null, epoch = 0;
+  const discard = () => { epoch++; checkpoint = null; };
+  async function scan({ conversationId, branch = null, resume = false, signal, isCurrent = () => true, onUpdate = () => {} }) {
     if (!C.id(conversationId) || (branch != null && !C.id(branch))) return { status: 'stopped', reason: 'scope' };
     const controller = new AbortController(), started = Date.now();
     const abort = () => controller.abort();
@@ -28,11 +30,16 @@ function createCWMScanner(C, env) {
     if (signal?.aborted) abort();
     let token = null, totalBytes = 0, pages = 0, format = null, leaf = null, mode = 'unknown';
     let entries = new Map(), order = [], firstSignature = null, exhausted = false, result = null;
-    const cursors = new Set();
+    let ledger = [], historyStartReached = false;
+    let cursors = new Set(), nextURL = null, lastURL = null, lastSignature = null, segmentPages = 0, budgetType = null;
+    const saved = resume && checkpoint?.conversationId === conversationId && (!branch || branch === checkpoint.leaf) ? checkpoint : null;
+    discard(); const runEpoch = epoch;
+    if (saved) ({entries, order, firstSignature, exhausted, historyStartReached, ledger, cursors, nextURL, lastURL, lastSignature, format, leaf, mode, pages} = saved);
+    const budget = type => { budgetType = type; fail('budget'); };
     function guard() {
       if (controller.signal.aborted) fail('cancelled');
-      if (!isCurrent()) fail('changed');
-      if (Date.now() - started > limits.duration) fail('budget');
+      if (!isCurrent() || epoch !== runEpoch) fail('changed');
+      if (Date.now() - started > limits.duration) budget('duration');
     }
     function currentStats(verified = false) {
       let nodes = order.map(id => entries.get(id));
@@ -43,12 +50,33 @@ function createCWMScanner(C, env) {
           const e = entries.get(id); if (e.stats) nodes.push(e); id = e.parent;
         }
       }
-      return { ...C.aggregate(nodes.map(e => e.stats)), activeIds: nodes.filter(e => e.stats).map(e => e.id),
+      const pageRows = ledger.map(row => ({...row, counted: 0, tokens: 0}));
+      const roleCounts = {}, contentTypes = {}, largest = [];
+      let hiddenMessages = 0, hiddenTokens = 0;
+      for (const e of nodes) {
+        const row = pageRows[e.page - 1];
+        row.tokens += e.stats.tokens; row.counted++;
+        roleCounts[e.author] = (roleCounts[e.author] || 0) + 1;
+        contentTypes[e.type] = (contentTypes[e.type] || 0) + 1;
+        if (e.hidden) { hiddenMessages++; hiddenTokens += e.stats.tokens; }
+        if (largest.length < 5 || e.stats.tokens > largest[4].tokens) {
+          largest.push({page:e.page, role:e.author, type:e.type, tokens:e.stats.tokens});
+          largest.sort((a,b) => b.tokens-a.tokens); largest.length = Math.min(largest.length, 5);
+        }
+      }
+      const diagnostics = {format, pageRows, largest, roleCounts, contentTypes, hiddenMessages, hiddenTokens,
+        uniqueMessages: ledger.reduce((n,r) => n + r.newMessages, 0),
+        rawItems: ledger.reduce((n,r) => n + r.raw, 0),
+        duplicateIds: ledger.reduce((n,r) => n + r.within + r.overlap, 0)};
+      return { ...C.aggregate(nodes.map(e => e.stats)), diagnostics, activeIds: nodes.filter(e => e.stats).map(e => e.id),
         branch: leaf, mode, source: 'scan', coverage: verified ? 'branch' : 'scanned-pages',
         complete: verified, exhausted, pages };
     }
     function report(status, reason = null, verified = false) {
-      const value = { status, reason, pages, exhausted, stats: currentStats(verified), mode };
+      const scanState = status === 'done' ? 'complete' : reason === 'timeout' ? 'timed_out'
+        : reason === 'budget' ? 'budget_exhausted' : 'partial';
+      const value = { status, scanState, historyStartReached, headVerified: status === 'done', branchVerified: verified, reason, pages, exhausted, stats: currentStats(verified), mode, budgetType,
+        resumable: status === 'stopped' && !!checkpoint };
       onUpdate(value); return value;
     }
     async function json(path, session = false) {
@@ -76,7 +104,8 @@ function createCWMScanner(C, env) {
         while (true) {
           const { done, value } = await reader.read(); guard(); if (done) break;
           count += value.byteLength; totalBytes += value.byteLength;
-          if (count > (session ? 1024 * 1024 : limits.pageBytes) || totalBytes > limits.bytes) fail('budget');
+          if (count > (session ? 1024 * 1024 : limits.pageBytes)) budget('pageBytes');
+          if (totalBytes > limits.bytes) budget('bytes');
           raw += decoder.decode(value, { stream: true });
         }
         raw += decoder.decode();
@@ -91,6 +120,8 @@ function createCWMScanner(C, env) {
         if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
       }
     }
+    const types = new Set(['text','code','execution_output','thoughts','reasoning_recap','multimodal_text',
+      'user_editable_context','model_editable_context','tether_browsing_display','tether_quote','computer_output','system_error','tool_result']);
     async function parse(data, first) {
       if (!data || typeof data !== 'object' || Array.isArray(data)) fail('schema');
       if (data.conversation_id != null && data.conversation_id !== conversationId) fail('scope');
@@ -103,20 +134,27 @@ function createCWMScanner(C, env) {
       if (!first && current && current !== leaf) fail('changed');
       const kind = Array.isArray(data.messages) ? 'messages' : data.mapping && typeof data.mapping === 'object' && !Array.isArray(data.mapping) ? 'mapping' : null;
       if (!kind || (format && kind !== format)) fail('schema');
-      const items = [], seen = new Set();
+      const items = [], seen = new Map();
+      let raw = 0;
       const add = async (id, message, parent) => {
-        if (!C.id(id) || seen.has(id)) fail('schema'); seen.add(id);
+        raw++; if (!C.id(id)) fail('schema');
         if (message && (message.id !== id || typeof message.author?.role !== 'string' ||
           !message.content || typeof message.content !== 'object' || Array.isArray(message.content))) fail('schema');
-        const stats = message ? C.messageStats(message) : null;
-        const signature = await digest(JSON.stringify([stats, parent, message ? C.text(message.content) : null]));
-        guard(); items.push({ id, parent, stats, signature });
+        const measured = {};
+        const stats = message ? C.messageStats(message, env.countTokens, measured) : null;
+        const type = types.has(message?.content.content_type) ? message.content.content_type : 'other';
+        const author = C.ROLES.includes(message?.author.role) ? message.author.role : 'other';
+        const hidden = message?.metadata?.is_visually_hidden_from_conversation === true;
+        const signature = await digest(JSON.stringify([stats, parent, measured.value ?? null, type, author, hidden]));
+        guard();
+        if (seen.has(id)) { if (seen.get(id) !== signature) fail('conflict'); return; }
+        seen.set(id, signature); items.push({ id, parent, stats, signature, type, author, hidden });
       };
       if (kind === 'messages') {
-        if (data.messages.length > limits.messages) fail('budget');
+        if (data.messages.length > limits.messages) budget('messages');
         for (const m of data.messages) { if (!m) fail('schema'); await add(m.id, m, undefined); }
       } else {
-        if (Object.keys(data.mapping).length > limits.messages) fail('budget');
+        if (Object.keys(data.mapping).length > limits.messages) budget('messages');
         for (const [id, node] of Object.entries(data.mapping)) {
           if (!node || !Object.hasOwn(node, 'parent') || !(node.parent === null || node.parent === '' || C.id(node.parent))) fail('schema');
           await add(id, node.message || null, node.parent);
@@ -124,20 +162,21 @@ function createCWMScanner(C, env) {
       }
       let more = data.page_info?.has_previous_page, cursor = data.page_info?.start_cursor;
       if (typeof more !== 'boolean') {
-        if (kind !== 'mapping') fail('schema');
+        if (kind !== 'mapping' || data.page_info != null) fail('schema');
         more = null; // No pagination metadata: only a closed parent chain proves an endpoint.
       }
       if (more && (typeof cursor !== 'string' || cursor.length < 1 || cursor.length > 4096)) fail('cursor');
-      return { kind, current, items, more, cursor: more ? cursor : null };
+      if (data.page_info?.has_next_page != null && typeof data.page_info.has_next_page !== 'boolean') fail('schema');
+      return { kind, current, items, more, raw, newer: data.page_info?.has_next_page === true, cursor: more ? cursor : null };
     }
-    function signature(page) { return JSON.stringify([page.kind, page.current, page.more,
+    function signature(page) { return JSON.stringify([page.kind, page.current, page.more, page.cursor, page.newer, page.raw,
       page.kind === 'mapping' ? page.items.map(e => [e.id, e.signature]).sort((a,b) => a[0].localeCompare(b[0])) : page.items.map(e => [e.id, e.signature])]); }
     function merge(page, first) {
       if (first) { format = page.kind; leaf = page.current; }
       const next = page.items.filter(e => !entries.has(e.id));
       for (const e of page.items) if (entries.has(e.id) && entries.get(e.id).signature !== e.signature) fail('conflict');
-      if (!first && !next.length && page.items.length) fail('cursor');
-      if (entries.size + next.length > limits.messages) fail('budget');
+      if (page.more && (cursors.has(page.cursor) || (!first && !next.length))) fail('cursor');
+      if (entries.size + next.length > limits.messages) budget('messages');
       if (format === 'messages' && !first) {
         // Older page can overlap only as a suffix matching the oldest known prefix.
         const overlap = page.items.filter(e => entries.has(e.id)).map(e => e.id);
@@ -145,7 +184,9 @@ function createCWMScanner(C, env) {
         if (overlap.length && (JSON.stringify(overlap) !== JSON.stringify(suffix) ||
           JSON.stringify(overlap) !== JSON.stringify(order.slice(0, overlap.length)))) fail('conflict');
       }
-      for (const e of next) entries.set(e.id, e);
+      ledger.push({raw:page.raw, within:page.raw-page.items.length, overlap:page.items.length-next.length,
+        newMessages:next.filter(e => e.stats).length});
+      for (const e of next) { e.page = pages + 1; entries.set(e.id, e); }
       order = [...next.map(e => e.id), ...order];
     }
     function verifiedBranch() {
@@ -153,32 +194,50 @@ function createCWMScanner(C, env) {
       const seen = new Set(); let id = leaf;
       while (id) {
         if (seen.has(id) || !entries.has(id)) return false; seen.add(id);
-        id = entries.get(id).parent;
+        const parent = entries.get(id).parent;
+        if (parent === null) return true;
+        id = parent;
       }
-      return true;
+      return false;
     }
     const initial = new URL('/backend-api/conversations/' + conversationId, 'https://chatgpt.com');
     initial.searchParams.set('num_turns', '10'); initial.searchParams.set('include_has_versions', 'true');
-    if (branch) initial.searchParams.set('include_message_id', branch);
+    if (saved ? saved.requestBranch : branch) initial.searchParams.set('include_message_id', saved ? saved.requestBranch : branch);
     try {
       guard(); report('auth');
       let session = await json('/api/auth/session', true);
       if (typeof session?.accessToken !== 'string' || !/^[\x21-\x7E]{1,32768}$/.test(session.accessToken)) fail('auth');
       token = session.accessToken; session = null;
-      let url = initial.href;
-      while (true) {
-        guard(); if (pages >= limits.pages) fail('budget');
+      if (saved) {
+        const head = await parse(await json(initial.href), true);
+        if (signature(head) !== firstSignature) fail('changed');
+        if (lastURL !== initial.href && lastURL) {
+          const boundary = await parse(await json(lastURL), false);
+          if (signature(boundary) !== lastSignature || (nextURL && boundary.cursor !== new URL(nextURL).searchParams.get('before'))) fail('changed');
+        }
+      } else nextURL = initial.href;
+      while (!exhausted) {
+        guard(); if (segmentPages >= limits.pages) budget('pages');
+        const url = nextURL;
         let data = await json(url), page = await parse(data, pages === 0); data = null;
         const first = pages === 0;
-        merge(page, first); pages++;
+        merge(page, first); pages++; segmentPages++;
         if (first) firstSignature = signature(page);
-        exhausted = page.more === false || (page.more === null && verifiedBranch()); report('reading');
+        exhausted = page.more === false || (page.more === null && verifiedBranch());
+        lastURL = url; lastSignature = signature(page);
+        if (first && page.newer) fail('newer-pages');
         if (page.more === null && !exhausted) fail('schema');
-        if (exhausted) break;
-        if (cursors.has(page.cursor)) fail('cursor'); cursors.add(page.cursor);
+        if (exhausted) {
+          if (format === 'mapping' && !verifiedBranch()) fail('missing-parent');
+          historyStartReached = true;
+          if (format === 'messages' && order[order.length-1] !== leaf) fail('missing-leaf');
+          nextURL = null; report('reading'); break;
+        }
+        cursors.add(page.cursor);
         const next = new URL('/backend-api/conversations/' + conversationId + '/messages', 'https://chatgpt.com');
         next.searchParams.set('before', page.cursor); next.searchParams.set('num_turns', '10');
-        next.searchParams.set('include_has_versions', 'true'); url = next.href; page = null;
+        next.searchParams.set('include_has_versions', 'true'); nextURL = next.href; page = null;
+        report('reading');
         await pause(limits.interval, controller.signal);
       }
       report('verifying'); await pause(limits.interval, controller.signal);
@@ -189,18 +248,24 @@ function createCWMScanner(C, env) {
     } catch (e) {
       // Never echo server errors, URLs, bodies, IDs or auth values into UI/logs.
       const reason = codes.has(e.message) ? e.message : 'network';
+      if (pages && runEpoch === epoch && isCurrent() && (['timeout','network','cancelled','rate-limit'].includes(reason) ||
+        (reason === 'budget' && ['duration','pages','bytes'].includes(budgetType)))) {
+        checkpoint = { conversationId, requestBranch: saved ? saved.requestBranch : branch, entries, order, firstSignature, exhausted, historyStartReached, ledger,
+          cursors, nextURL, lastURL, lastSignature, format, leaf, mode, pages };
+      }
       if (reason === 'changed' || reason === 'conflict' || reason === 'scope') {
-        entries.clear(); order = []; exhausted = false;
+        entries.clear(); order = []; ledger = []; exhausted = false; historyStartReached = false;
       }
       try { result = report('stopped', reason); }
-      catch { result = { status: 'stopped', reason: 'conflict', pages, exhausted: false, stats: null }; onUpdate(result); }
+      catch { result = { status: 'stopped', reason: 'conflict', pages, scanState: 'partial', exhausted: false, historyStartReached: false, headVerified: false, stats: null }; onUpdate(result); }
     } finally {
-      token = null; entries.clear(); order = []; cursors.clear(); firstSignature = null;
+      token = null; if (checkpoint?.entries !== entries) { entries.clear(); cursors.clear(); }
+      order = []; firstSignature = null;
       signal?.removeEventListener('abort', abort); controller.abort();
     }
     return result;
   }
-  return { scan };
+  return { scan, discard };
 }
 // Node test export; excluded from browser bundles.
 module.exports = createCWMScanner;

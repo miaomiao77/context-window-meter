@@ -27,3 +27,5 @@
 @media (max-width: 600px) { #cwm-reminder { right: 12px; bottom: 12px; } #cwm-panel { padding: 14px; } }
 
 #cwm-reminder button:disabled { opacity: .5; cursor: default; }
+
+#cwm-diagnostics { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 18rem; overflow: auto; }

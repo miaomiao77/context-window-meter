@@ -35,7 +35,12 @@ const older={messages:[msg('u1','user','旧问题'),msg('a1','assistant','旧回
   await waitFor(()=>!el('scan-cancel').hidden);assert.equal(el('scan-start').disabled,true);
   await run;await waitFor(()=>/接口历史已读完/.test(el('state').textContent));
   assert.match(el('counts').textContent,/2 条用户消息 · 12 个字符/);
+  assert.match(el('estimate').textContent,/已读历史：8 个文本 token（o200k_base）/);
   assert.match(el('state').textContent,/分支关系未验证/);assert.match(el('scan-status').textContent,/已读 2 页/);
+  el('scan-details').open=true;
+  await waitFor(()=>/唯一消息 ID 4/.test(el('diagnostics').textContent));
+  assert.match(el('diagnostics').textContent,/起点已到达/);
+  assert.doesNotMatch(el('diagnostics').textContent,/新回答|旧问题/);
   assert.equal(calls.length,4);assert.equal(el('scan-start').disabled,false);assert.equal(el('scan-cancel').hidden,true);
   assert.deepEqual(writes,[]);assert.equal(JSON.stringify(bridge).includes('test-private-token'),false);
   // Same-length edit must invalidate a previous scan, not silently keep its larger total.
@@ -44,7 +49,7 @@ const older={messages:[msg('u1','user','旧问题'),msg('a1','assistant','旧回
   await waitFor(()=>/页面可见内容/.test(el('state').textContent));
   const again=start({isTrusted:true});await waitFor(()=>/正在读取/.test(el('scan-status').textContent));
   el('scan-cancel').click();await again;
-  assert.match(el('scan-status').textContent,/已取消/);assert.match(el('state').textContent,/尚不完整/);
+  assert.match(el('scan-status').textContent,/已取消/);assert.match(el('state').textContent,/尚不完整/);assert.match(el('estimate').textContent,/部分小计.*尚未确认到达历史起点/);
   assert.equal(calls.length,6,'cancel during interval must prevent the next request');
   // New message insertion invalidates even an unverified/partial result.
   d.querySelector('main').insertAdjacentHTML('beforeend','<article><div data-message-id="u3" data-message-author-role="user">第三条</div></article>');

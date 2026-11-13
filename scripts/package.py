@@ -12,6 +12,7 @@ version = json.loads((root / 'manifest.json').read_text())['version']
 output = root / 'dist' / f'context-continuation-reminder-{version}.zip'
 output.parent.mkdir(exist_ok=True)
 files = ['manifest.json', 'page_script.js', 'content.js', 'styles.css',
+         'licenses/gpt-tokenizer.txt', 'licenses/Unicode.txt', 'docs/MEASUREMENT.md',
          'LICENSE', 'README.md', 'PRIVACY.md', 'INSTALL.md', 'docs/VALIDATION.md', 'docs/IMPLEMENTATION_STATUS.md', 'docs/PAGINATION_EVIDENCE.md', 'docs/SCAN_DESIGN.md',
          'icons/icon16.png', 'icons/icon48.png', 'icons/icon128.png']
 with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:

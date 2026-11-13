@@ -114,3 +114,41 @@ test('scanner only exists in isolated entry, trusted click required and MAIN bri
   assert.ok(ui.includes('if (!event.isTrusted || manualController) return;'));
   assert.equal(ui.includes('cwmScanToken'),false);
 });
+
+test('terminal mapping with dangling parent stays partial', async () => {
+  const head = { current_node:'a', mapping:{a:{parent:'missing',message:message('a')}}, page_info:{has_previous_page:false} };
+  const r = await setup([session(),head]).run();
+  assert.equal(r.reason,'missing-parent'); assert.equal(r.scanState,'partial'); assert.equal(r.historyStartReached,false);
+});
+test('a fully overlapping terminal page can certify the end without extra tokens', async () => {
+  const h=initial(), last={messages:[h.messages[0]],page_info:{has_previous_page:false}};
+  const r=await setup([session(),h,last,h]).run();
+  assert.equal(r.scanState,'complete'); assert.equal(r.historyStartReached,true); assert.equal(r.headVerified,true);
+  assert.equal(r.branchVerified,false); assert.equal(r.stats.diagnostics.pageRows[1].tokens,0);
+});
+test('cyclic cursor rejects new data before tally', async () => {
+  const h=initial(), r=await setup([session(),h,{messages:[message('foreign')],page_info:h.page_info}]).run();
+  assert.equal(r.reason,'cursor');assert.equal(r.pages,1);assert.equal(r.stats.messages,2);
+});
+test('check the newest endpoint as well as the oldest', async () => {
+  const h=initial();h.page_info={has_previous_page:false,has_next_page:true};
+  assert.equal((await setup([session(),h]).run()).reason,'newer-pages');
+  h.page_info.has_next_page=false;h.current_node='u2';
+  assert.equal((await setup([session(),h]).run()).reason,'missing-leaf');
+});
+test('diagnostics reconcile within-page and cross-page duplicates without payloads', async () => {
+  const h=initial(),p=older();p.messages.unshift(p.messages[0]);
+  h.messages[1].metadata={is_visually_hidden_from_conversation:true};h.messages[1].content.content_type='execution_output';
+  const r=await setup([session(),h,p,h]).run(),d=r.stats.diagnostics;
+  assert.equal(d.rawItems,6);assert.equal(d.uniqueMessages,4);assert.equal(d.duplicateIds,2);
+  assert.equal(d.hiddenMessages,1);assert.equal(d.contentTypes.execution_output,1);
+  assert.equal(d.pageRows.reduce((n,p)=>n+p.tokens,0),r.stats.tokens);assert.doesNotMatch(JSON.stringify(d),/私密原文|cursor\/older/);
+});
+test('timeout before and after end and budget exhaustion are independent of completion', async () => {
+  const h=initial(), hung=(_url,o)=>new Promise((_,reject)=>o.signal.addEventListener('abort',()=>reject(Error('timeout'))));
+  const r=await setup([session(),h,hung],{requestTime:15}).run();
+  assert.equal(r.scanState,'timed_out');assert.equal(r.historyStartReached,false);
+  const b=await setup([session(),h],{pages:1}).run();assert.equal(b.scanState,'budget_exhausted');
+  const end=await setup([session(),h,older(),hung],{requestTime:15}).run();
+  assert.equal(end.historyStartReached,true);assert.equal(end.headVerified,false);assert.equal(end.scanState,'timed_out');
+});
